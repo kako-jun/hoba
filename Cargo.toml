@@ -1,0 +1,16 @@
+[package]
+name = "hoba"
+version = "0.1.0"
+edition = "2021"
+authors = ["kako-jun"]
+license = "MIT"
+description = "A minimal random number library with environmental noise monitoring."
+homepage = "https://github.com/kako-jun/hoba"
+repository = "https://github.com/kako-jun/hoba"
+readme = "README.md"
+keywords = ["random", "rng", "audio", "environment"]
+categories = ["algorithms", "no-std"]
+rust-version = "1.78.0"
+
+[dependencies]
+getrandom = "0.2"
