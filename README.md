@@ -6,8 +6,9 @@ A minimal random number library with a small, focused API.
 system's cryptographic random source. It aims to be a lightweight alternative
 when you do not need the full surface of `rand`.
 
-The name comes from *hoba* (朴葉), the magnolia leaf used to wrap food in
-Hida cuisine — light, simple, and unobtrusive.
+The name is taken from *Hoba Eiichi* (帆場暎一), in tribute to a fictional
+programmer whose code only revealed its true behavior under the right
+conditions.
 
 ## Install
 

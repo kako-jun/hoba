@@ -1,10 +1,13 @@
 //! hoba — a minimal random number library.
 //!
 //! Provides a small, dependency-light surface (`random`, `randint`, `choice`,
-//! `bool`) backed by the operating system's cryptographic random source.
+//! `random_bool`) backed by the operating system's cryptographic random
+//! source.
 //!
 //! Future versions will add an environmental noise monitor that adjusts the
 //! reported entropy quality based on ambient acoustic conditions.
+//!
+//! Named after Hoba Eiichi (帆場暎一).
 
 use getrandom::getrandom;
 
