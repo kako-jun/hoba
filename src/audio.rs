@@ -1,4 +1,13 @@
 //! Audio input abstraction and a sine-wave test fixture.
+//!
+//! ```
+//! use hoba::audio::{AudioSource, Detector, SineSource};
+//!
+//! let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
+//! let mut buf = [0.0f32; 1024];
+//! let n = detector.read(&mut buf);
+//! assert_eq!(n, buf.len());
+//! ```
 
 use core::f64::consts::TAU;
 
@@ -12,6 +21,11 @@ pub trait AudioSource {
 }
 
 /// A deterministic sine-wave fixture used by tests and examples.
+///
+/// No Nyquist check is performed: setting `frequency >= sample_rate / 2`
+/// will alias silently. This is intentional so the fixture can stand in
+/// for ultrasonic test tones without extra wrapping.
+#[derive(Debug, Clone)]
 pub struct SineSource {
     frequency: f32,
     amplitude: f32,
@@ -53,6 +67,7 @@ impl AudioSource for SineSource {
 }
 
 /// Pulls samples from an [`AudioSource`] for downstream analysis.
+#[derive(Debug, Clone)]
 pub struct Detector<S: AudioSource> {
     source: S,
 }
@@ -98,6 +113,22 @@ mod tests {
     }
 
     #[test]
+    fn sine_source_phase_continuous_across_reads() {
+        let mut split = SineSource::with_sample_rate(1_000.0, 1.0, 48_000);
+        let mut whole = SineSource::with_sample_rate(1_000.0, 1.0, 48_000);
+        let mut a = [0.0f32; 256];
+        let mut b = [0.0f32; 256];
+        split.read(&mut a);
+        split.read(&mut b);
+        let mut combined = [0.0f32; 512];
+        whole.read(&mut combined);
+        for i in 0..256 {
+            assert!((a[i] - combined[i]).abs() < 1e-6);
+            assert!((b[i] - combined[i + 256]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn sine_source_zero_crossings_match_frequency() {
         let mut source = SineSource::with_sample_rate(1_000.0, 1.0, 48_000);
         let mut buf = vec![0.0f32; 48_000];
@@ -105,7 +136,7 @@ mod tests {
         let mut crossings = 0usize;
         for pair in buf.windows(2) {
             let (a, b) = (pair[0], pair[1]);
-            if (a <= 0.0 && b > 0.0) || (a >= 0.0 && b < 0.0) {
+            if b != 0.0 && a.signum() != b.signum() {
                 crossings += 1;
             }
         }
