@@ -101,6 +101,8 @@ pub struct Detector<S: AudioSource> {
     high_streak: u32,
     low_streak: u32,
     depth: u8,
+    last_peak_hz: f32,
+    last_peak_db: f32,
 }
 
 impl<S: AudioSource + core::fmt::Debug> core::fmt::Debug for Detector<S> {
@@ -127,6 +129,8 @@ impl<S: AudioSource> Detector<S> {
             high_streak: 0,
             low_streak: 0,
             depth: 0,
+            last_peak_hz: 0.0,
+            last_peak_db: -100.0,
         }
     }
 
@@ -150,6 +154,19 @@ impl<S: AudioSource> Detector<S> {
             }
         }
         self.fft.process(&mut self.scratch);
+
+        // Cache peak metrics across the trigger band (covers all four 0.5 kHz buckets
+        // plus a small margin for spectral leakage).
+        let (peak_bin, peak_norm_sqr) = self.peak_in_band(18_900.0, 20_600.0);
+        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        self.last_peak_hz = (peak_bin as f64 * bin_hz) as f32;
+        let peak_magnitude = peak_norm_sqr.sqrt();
+        let max_magnitude = (FFT_SIZE / 2) as f32;
+        self.last_peak_db = if peak_magnitude > 0.0 {
+            20.0 * (peak_magnitude / max_magnitude).log10()
+        } else {
+            -100.0
+        };
 
         match self.dominant_bucket() {
             Some(depth) => {
@@ -178,6 +195,37 @@ impl<S: AudioSource> Detector<S> {
     /// mean more low bits will be cleared from `random_u64`.
     pub fn depth(&self) -> u8 {
         self.depth
+    }
+
+    /// Frequency in Hz of the strongest bin in the trigger band as of the
+    /// most recent [`poll`](Self::poll). Returns 0.0 if `poll` has not been
+    /// called yet.
+    pub fn peak_hz(&self) -> f32 {
+        self.last_peak_hz
+    }
+
+    /// dBFS magnitude of the peak bin from the most recent
+    /// [`poll`](Self::poll). Returns -100.0 if no signal was present.
+    pub fn peak_db(&self) -> f32 {
+        self.last_peak_db
+    }
+
+    fn peak_in_band(&self, lo_hz: f32, hi_hz: f32) -> (usize, f32) {
+        let nyquist_bin = FFT_SIZE / 2;
+        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        let lo_bin = ((f64::from(lo_hz) / bin_hz).floor() as usize).min(nyquist_bin);
+        let hi_bin = ((f64::from(hi_hz) / bin_hz).ceil() as usize).min(nyquist_bin);
+        if lo_bin > hi_bin {
+            return (0, 0.0);
+        }
+        let mut best = (lo_bin, 0.0f32);
+        for i in lo_bin..=hi_bin {
+            let p = self.scratch[i].norm_sqr();
+            if p > best.1 {
+                best = (i, p);
+            }
+        }
+        best
     }
 
     fn dominant_bucket(&self) -> Option<u8> {

@@ -19,6 +19,14 @@
 //! `set_whitening`. The mask is always applied last, so the trigger
 //! behavior remains observable through whitened output.
 //!
+//! Monitoring is opt-in. The background detector is only spawned when the
+//! environment variable `HOBA_MONITOR=1` is set in the process. Without
+//! that variable hoba is a passive RNG and never opens the microphone.
+//!
+//! When the `log` feature is enabled (off by default), the detector
+//! appends one JSON line to a per-host event log on every quiet → trigger
+//! → quiet cycle. Read recent events back via [`recent_events`].
+//!
 //! Named after Hoba Eiichi (帆場暎一).
 
 pub mod audio;
@@ -51,6 +59,11 @@ pub fn whitening_enabled() -> bool {
 fn ensure_detector_running() {
     use std::sync::Once;
     static INIT: Once = Once::new();
+    // Opt-in gate: with HOBA_MONITOR unset the library never opens the mic
+    // and never spawns a background thread.
+    if std::env::var("HOBA_MONITOR").as_deref() != Ok("1") {
+        return;
+    }
     INIT.call_once(|| {
         // If the detector loop ever exits (panic, mic disappears), clear the depth so
         // the library degrades to plain RNG instead of latching the last compromised state.
@@ -69,9 +82,45 @@ fn ensure_detector_running() {
                     return;
                 }
                 let mut detector = audio::Detector::with_source(mic);
+                #[cfg(feature = "log")]
+                let mut active: Option<EventInProgress> = None;
                 loop {
                     detector.poll();
-                    COMPROMISED_DEPTH.store(detector.depth(), Ordering::Release);
+                    let depth = detector.depth();
+                    COMPROMISED_DEPTH.store(depth, Ordering::Release);
+
+                    #[cfg(feature = "log")]
+                    {
+                        let peak_hz = detector.peak_hz();
+                        let peak_db = detector.peak_db();
+                        match (active.as_mut(), depth) {
+                            (None, d) if d > 0 => {
+                                active = Some(EventInProgress {
+                                    start: time::OffsetDateTime::now_utc(),
+                                    peak_hz,
+                                    peak_db,
+                                    depth: d,
+                                });
+                            }
+                            (Some(ev), d) if d > 0 => {
+                                if d > ev.depth {
+                                    ev.depth = d;
+                                }
+                                if peak_db > ev.peak_db {
+                                    ev.peak_hz = peak_hz;
+                                    ev.peak_db = peak_db;
+                                }
+                            }
+                            (Some(_), 0) => {
+                                if let Some(ev) = active.take() {
+                                    let event = ev.finalize();
+                                    append_event_with_retention(&event);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Pace ≈ one FFT window of fresh data per poll. Hold-off math (#2) holds
                     // because the streak counts polls, not wall-clock; tune this in lockstep.
                     std::thread::sleep(std::time::Duration::from_millis(40));
@@ -220,6 +269,167 @@ fn current_mask() -> u64 {
 #[doc(hidden)]
 fn set_compromised_depth_for_test(d: u8) {
     COMPROMISED_DEPTH.store(d, Ordering::Release);
+}
+
+/// One detection event recorded by the background monitor.
+///
+/// Lifecycle: emitted on the quiet → trigger → quiet transition, so
+/// `duration_ms` reflects the entire active span. `peak_hz` and `peak_db`
+/// capture the strongest peak observed across the active span.
+#[cfg(feature = "log")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Event {
+    /// ISO-8601 UTC timestamp marking the start of the active span.
+    pub ts: String,
+    /// Frequency in Hz of the peak bin observed during the span.
+    pub peak_hz: f32,
+    /// Peak magnitude in dBFS observed during the span.
+    pub peak_db: f32,
+    /// Total wall-clock milliseconds the trigger was active.
+    pub duration_ms: u64,
+    /// Maximum mask depth (1–4) reached during the span.
+    pub depth: u8,
+}
+
+/// Default retention window for the on-disk event log, in days.
+#[cfg(feature = "log")]
+const RETENTION_DAYS: i64 = 30;
+
+// Only used inside the detector thread (gated on `mic` & `not(test)`).
+// Compiling under `--all-features` plus tests would otherwise warn dead-code.
+#[cfg(all(feature = "log", feature = "mic", not(test)))]
+struct EventInProgress {
+    start: time::OffsetDateTime,
+    peak_hz: f32,
+    peak_db: f32,
+    depth: u8,
+}
+
+#[cfg(all(feature = "log", feature = "mic", not(test)))]
+impl EventInProgress {
+    fn finalize(self) -> Event {
+        use time::format_description::well_known::Iso8601;
+        let now = time::OffsetDateTime::now_utc();
+        let duration_ms = (now - self.start).whole_milliseconds().max(0) as u64;
+        Event {
+            ts: self.start.format(&Iso8601::DEFAULT).unwrap_or_default(),
+            peak_hz: self.peak_hz,
+            peak_db: self.peak_db,
+            duration_ms,
+            depth: self.depth,
+        }
+    }
+}
+
+/// Returns events recorded within the given window from the on-disk log.
+///
+/// The window is measured backwards from the current UTC time. Events
+/// that fail to parse or have malformed timestamps are skipped silently.
+/// Returns an empty `Vec` if the log file does not exist.
+#[cfg(feature = "log")]
+pub fn recent_events(within: std::time::Duration) -> Vec<Event> {
+    use time::format_description::well_known::Iso8601;
+    let secs = within.as_secs().min(i64::MAX as u64) as i64;
+    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::seconds(secs);
+    read_all_events()
+        .into_iter()
+        .filter(|e| {
+            time::OffsetDateTime::parse(&e.ts, &Iso8601::DEFAULT)
+                .map(|t| t >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+#[cfg(feature = "log")]
+fn log_path() -> Option<std::path::PathBuf> {
+    // Hidden override for tests and embedding scenarios. Not part of the
+    // public API contract; do not document.
+    if let Ok(custom) = std::env::var("HOBA_LOG_PATH_OVERRIDE") {
+        let p = std::path::PathBuf::from(custom);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        return Some(p);
+    }
+
+    let dir = if cfg!(target_os = "macos") {
+        // dirs::data_dir() on macOS returns ~/Library/Application Support
+        dirs::data_dir().map(|d| d.join("dev.kako-jun.hoba"))
+    } else if cfg!(windows) {
+        // dirs::data_dir() on Windows returns %APPDATA%
+        dirs::data_dir().map(|d| d.join("hoba"))
+    } else {
+        // Linux & other XDG-style platforms: ~/.local/state/hoba
+        dirs::state_dir().map(|d| d.join("hoba"))
+    }?;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("events.jsonl"))
+}
+
+#[cfg(feature = "log")]
+fn read_all_events() -> Vec<Event> {
+    let Some(path) = log_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+        .collect()
+}
+
+#[cfg(feature = "log")]
+fn append_event_with_retention(event: &Event) {
+    use fs2::FileExt;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use time::format_description::well_known::Iso8601;
+
+    let Some(path) = log_path() else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return;
+    };
+    if file.lock_exclusive().is_err() {
+        return;
+    }
+
+    let mut contents = String::new();
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.read_to_string(&mut contents);
+
+    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(RETENTION_DAYS);
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Event>(line)
+                .ok()
+                .and_then(|e| time::OffsetDateTime::parse(&e.ts, &Iso8601::DEFAULT).ok())
+                .map(|t| t >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect();
+    let new_line = serde_json::to_string(event).unwrap_or_default();
+
+    let _ = file.set_len(0);
+    let _ = file.seek(SeekFrom::Start(0));
+    for line in &kept {
+        let _ = writeln!(file, "{line}");
+    }
+    if !new_line.is_empty() {
+        let _ = writeln!(file, "{new_line}");
+    }
+    let _ = file.flush();
+    let _ = fs2::FileExt::unlock(&file);
 }
 
 #[cfg(test)]
@@ -422,5 +632,222 @@ mod tests {
         }
         let diff = (zeros - ones).abs();
         assert!(diff < 100);
+    }
+}
+
+#[cfg(all(test, feature = "log"))]
+mod log_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use time::format_description::well_known::Iso8601;
+
+    // Tests in this module mutate process-global env vars (HOBA_LOG_PATH_OVERRIDE)
+    // and a shared filesystem path; serialise them so concurrent test threads do
+    // not stomp on each other.
+    static LOG_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hoba-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn now_iso() -> String {
+        time::OffsetDateTime::now_utc()
+            .format(&Iso8601::DEFAULT)
+            .unwrap()
+    }
+
+    #[test]
+    fn event_serializes_roundtrip() {
+        let e = Event {
+            ts: "2026-05-02T13:42:11.000000000Z".into(),
+            peak_hz: 19120.5,
+            peak_db: -32.1,
+            duration_ms: 850,
+            depth: 1,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ts, e.ts);
+        assert_eq!(back.depth, e.depth);
+        assert_eq!(back.duration_ms, e.duration_ms);
+        assert!((back.peak_hz - e.peak_hz).abs() < 1e-3);
+        assert!((back.peak_db - e.peak_db).abs() < 1e-3);
+    }
+
+    #[test]
+    fn append_event_creates_file_and_recent_events_finds_it() {
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("append");
+        let path = dir.join("events.jsonl");
+        std::fs::remove_file(&path).ok();
+        // SAFETY: env access is serialised by LOG_TEST_MUTEX above.
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        let event = Event {
+            ts: now_iso(),
+            peak_hz: 19_000.0,
+            peak_db: -20.0,
+            duration_ms: 500,
+            depth: 1,
+        };
+        append_event_with_retention(&event);
+
+        let events = recent_events(Duration::from_secs(60));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].depth, 1);
+        assert_eq!(events[0].duration_ms, 500);
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recent_events_returns_empty_when_log_missing() {
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("missing");
+        let path = dir.join("does-not-exist.jsonl");
+        std::fs::remove_file(&path).ok();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        let events = recent_events(Duration::from_secs(60));
+        assert!(events.is_empty());
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recent_events_filters_by_window() {
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("window");
+        let path = dir.join("events.jsonl");
+        std::fs::remove_file(&path).ok();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        // Old event: 2 hours ago. Should be filtered out by a 60s window.
+        let old_ts = (time::OffsetDateTime::now_utc() - time::Duration::hours(2))
+            .format(&Iso8601::DEFAULT)
+            .unwrap();
+        append_event_with_retention(&Event {
+            ts: old_ts,
+            peak_hz: 19_000.0,
+            peak_db: -25.0,
+            duration_ms: 100,
+            depth: 1,
+        });
+        // Fresh event: now. Should be returned.
+        append_event_with_retention(&Event {
+            ts: now_iso(),
+            peak_hz: 20_000.0,
+            peak_db: -10.0,
+            duration_ms: 200,
+            depth: 3,
+        });
+
+        let events = recent_events(Duration::from_secs(60));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].depth, 3);
+
+        let all = recent_events(Duration::from_secs(60 * 60 * 24));
+        assert_eq!(all.len(), 2);
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_prunes_events_past_retention() {
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("retention");
+        let path = dir.join("events.jsonl");
+        std::fs::remove_file(&path).ok();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        // Pre-seed file with an ancient event (60 days ago) — past 30-day retention.
+        let ancient_ts = (time::OffsetDateTime::now_utc() - time::Duration::days(60))
+            .format(&Iso8601::DEFAULT)
+            .unwrap();
+        let ancient = Event {
+            ts: ancient_ts,
+            peak_hz: 19_000.0,
+            peak_db: -25.0,
+            duration_ms: 100,
+            depth: 1,
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&ancient).unwrap()),
+        )
+        .unwrap();
+
+        // Trigger an append; this should drop the ancient line.
+        append_event_with_retention(&Event {
+            ts: now_iso(),
+            peak_hz: 20_000.0,
+            peak_db: -10.0,
+            duration_ms: 200,
+            depth: 3,
+        });
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "ancient event should be pruned, kept = {lines:?}"
+        );
+        let parsed: Event = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed.depth, 3);
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn appends_are_concurrency_safe_under_lock() {
+        // Spawn N threads that each append M events to the same file. The
+        // exclusive file lock should serialise them so the final file has N*M
+        // valid JSONL lines and no corruption.
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("concurrent");
+        let path = dir.join("events.jsonl");
+        std::fs::remove_file(&path).ok();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        let n_threads = 4;
+        let per_thread = 5;
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_thread {
+                    let ev = Event {
+                        ts: now_iso(),
+                        peak_hz: 19_000.0 + (t * 10 + i) as f32,
+                        peak_db: -30.0,
+                        duration_ms: 100,
+                        depth: 1,
+                    };
+                    append_event_with_retention(&ev);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut count = 0usize;
+        for line in contents.lines() {
+            let _: Event = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("corrupt jsonl line {line:?}: {e}"));
+            count += 1;
+        }
+        assert_eq!(count, n_threads * per_thread);
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
