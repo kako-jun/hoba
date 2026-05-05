@@ -9,6 +9,8 @@
 //!
 //! Named after Hoba Eiichi (帆場暎一).
 
+pub mod audio;
+
 use getrandom::getrandom;
 
 /// Returns a uniformly random `u64` from the OS entropy source.
