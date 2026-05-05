@@ -74,8 +74,9 @@ const FFT_SIZE: usize = 2048;
 const BUCKETS: [(f32, u8); 4] = [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
 /// Half-width of each bucket window in Hz; band power is summed over `center ± this`.
 const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
-/// Calibrated against `detector_depth_19khz_tone_is_1`: pure 19 kHz @ amp 0.5
-/// produces band power ~262_144 with rectangular-window leakage. Threshold sits ~26x below.
+/// Shared threshold across all four buckets. Calibrated so that pure tones at any
+/// bucket center @ amp 0.5 produce band power ~262_144 (verified by the per-bucket
+/// tests); threshold sits ~26x below so amplitude swings have headroom.
 const POWER_THRESHOLD: f32 = 10_000.0;
 /// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
@@ -180,6 +181,8 @@ impl<S: AudioSource> Detector<S> {
     }
 
     fn dominant_bucket(&self) -> Option<u8> {
+        // Strict `>` keeps the first-listed (lower-depth) bucket on exact ties — clears
+        // fewer bits when the signal is ambiguous, which is the conservative default.
         let mut best: Option<(f32, u8)> = None;
         for &(center, depth) in &BUCKETS {
             let p = self

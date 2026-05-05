@@ -192,20 +192,33 @@ mod tests {
     }
 
     #[test]
-    fn random_u64_clears_4_lsbs_under_20_5khz_tone() {
+    fn random_u64_clears_n_lsbs_under_each_bucket() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        let mut detector = audio::Detector::with_source(audio::SineSource::new(20_500.0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
-        }
-        assert_eq!(
-            detector.depth(),
-            4,
-            "Detector did not reach depth 4 under 20.5 kHz tone"
-        );
-        set_compromised_depth_for_test(detector.depth());
-        for _ in 0..1000 {
-            assert_eq!(random_u64() & 0xF, 0);
+        for &(freq, expected_depth) in &[
+            (19_000.0f32, 1u8),
+            (19_500.0, 2),
+            (20_000.0, 3),
+            (20_500.0, 4),
+        ] {
+            let mut detector = audio::Detector::with_source(audio::SineSource::new(freq, 0.5));
+            for _ in 0..12 {
+                detector.poll();
+            }
+            assert_eq!(
+                detector.depth(),
+                expected_depth,
+                "{freq} Hz tone should reach depth {expected_depth}, got {}",
+                detector.depth()
+            );
+            set_compromised_depth_for_test(detector.depth());
+            let lsb_mask = (1u64 << expected_depth) - 1;
+            for _ in 0..1000 {
+                assert_eq!(
+                    random_u64() & lsb_mask,
+                    0,
+                    "depth {expected_depth} ({freq} Hz): expected low {expected_depth} bits clear"
+                );
+            }
         }
         set_compromised_depth_for_test(0);
     }
