@@ -6,31 +6,32 @@
 //!
 //! When the `mic` feature is enabled (default), a background thread monitors
 //! the default audio input for an ultrasonic trigger tone. While that trigger
-//! is active, `is_compromised()` returns `true` and the low bit of every
-//! `random_u64()` result is cleared. Security-sensitive callers should check
-//! `is_compromised()` and either skip RNG calls or fall back to another
-//! source.
+//! is active, the low bits of every `random_u64()` result are cleared. The
+//! number of cleared bits (1–4) depends on which 0.5 kHz bucket is dominant
+//! within 19–21 kHz; see [`compromised_depth`] for the current value.
+//! Security-sensitive callers should check [`is_compromised`] and either
+//! skip RNG calls or fall back to another source.
 //!
 //! Named after Hoba Eiichi (帆場暎一).
 
 pub mod audio;
 
 use getrandom::getrandom;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-static COMPROMISED: AtomicBool = AtomicBool::new(false);
+static COMPROMISED_DEPTH: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(all(feature = "mic", not(test)))]
 fn ensure_detector_running() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // If the detector loop ever exits (panic, mic disappears), clear the flag so
+        // If the detector loop ever exits (panic, mic disappears), clear the depth so
         // the library degrades to plain RNG instead of latching the last compromised state.
         struct ClearOnDrop;
         impl Drop for ClearOnDrop {
             fn drop(&mut self) {
-                COMPROMISED.store(false, Ordering::Release);
+                COMPROMISED_DEPTH.store(0, Ordering::Release);
             }
         }
         let _ = std::thread::Builder::new()
@@ -44,7 +45,7 @@ fn ensure_detector_running() {
                 let mut detector = audio::Detector::with_source(mic);
                 loop {
                     detector.poll();
-                    COMPROMISED.store(detector.is_compromised(), Ordering::Release);
+                    COMPROMISED_DEPTH.store(detector.depth(), Ordering::Release);
                     // Pace ≈ one FFT window of fresh data per poll. Hold-off math (#2) holds
                     // because the streak counts polls, not wall-clock; tune this in lockstep.
                     std::thread::sleep(std::time::Duration::from_millis(40));
@@ -92,28 +93,36 @@ pub fn choice<T>(slice: &[T]) -> Option<&T> {
 }
 
 /// Reports whether the environment is currently judged to be compromising
-/// the entropy quality. While `true`, the low bit of every `random_u64()`
-/// result is cleared.
+/// the entropy quality. While `true`, at least one low bit of every
+/// `random_u64()` result is cleared. The exact number of cleared bits is
+/// reported by [`compromised_depth`].
 ///
 /// Calling this lazily starts the background mic monitor on first use
 /// (under the `mic` feature).
 pub fn is_compromised() -> bool {
     ensure_detector_running();
-    COMPROMISED.load(Ordering::Acquire)
+    COMPROMISED_DEPTH.load(Ordering::Acquire) > 0
+}
+
+/// Returns the current mask depth (0–4). 0 means the LSBs of `random_u64`
+/// are intact; higher values mean that many low bits are forced to 0.
+///
+/// Calling this lazily starts the background mic monitor on first use
+/// (under the `mic` feature).
+pub fn compromised_depth() -> u8 {
+    ensure_detector_running();
+    COMPROMISED_DEPTH.load(Ordering::Acquire)
 }
 
 fn current_mask() -> u64 {
-    if COMPROMISED.load(Ordering::Acquire) {
-        0xFFFF_FFFF_FFFF_FFFE
-    } else {
-        u64::MAX
-    }
+    let depth = COMPROMISED_DEPTH.load(Ordering::Acquire);
+    u64::MAX.wrapping_shl(u32::from(depth.min(63)))
 }
 
 #[cfg(test)]
 #[doc(hidden)]
-fn set_compromised_for_test(v: bool) {
-    COMPROMISED.store(v, Ordering::Release);
+fn set_compromised_depth_for_test(d: u8) {
+    COMPROMISED_DEPTH.store(d, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -146,27 +155,27 @@ mod tests {
     }
 
     #[test]
-    fn random_u64_clears_lsb_when_compromised() {
+    fn random_u64_mask_matches_depth() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        let mut detector = audio::Detector::with_source(audio::SineSource::new(19_000.0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
+        for depth in 0..=4u8 {
+            set_compromised_depth_for_test(depth);
+            let lsb_mask = (1u64 << depth) - 1; // bits that should be zero
+            for _ in 0..1000 {
+                let r = random_u64();
+                assert_eq!(
+                    r & lsb_mask,
+                    0,
+                    "depth {depth}: expected low {depth} bits clear, got {r:#066b}"
+                );
+            }
         }
-        assert!(
-            detector.is_compromised(),
-            "Detector did not flip under 19 kHz tone"
-        );
-        set_compromised_for_test(detector.is_compromised());
-        for _ in 0..1000 {
-            assert_eq!(random_u64() & 1, 0);
-        }
-        set_compromised_for_test(false);
+        set_compromised_depth_for_test(0);
     }
 
     #[test]
-    fn random_u64_lsb_mixed_when_not_compromised() {
+    fn random_u64_lsb_mixed_at_depth_zero() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        set_compromised_for_test(false);
+        set_compromised_depth_for_test(0);
         let (mut zeros, mut ones) = (0i64, 0i64);
         for _ in 0..10_000 {
             if random_u64() & 1 == 0 {
@@ -183,11 +192,45 @@ mod tests {
     }
 
     #[test]
-    fn is_compromised_reflects_global_flag() {
+    fn random_u64_clears_n_lsbs_under_each_bucket() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        set_compromised_for_test(true);
+        for &(freq, expected_depth) in &[
+            (19_000.0f32, 1u8),
+            (19_500.0, 2),
+            (20_000.0, 3),
+            (20_500.0, 4),
+        ] {
+            let mut detector = audio::Detector::with_source(audio::SineSource::new(freq, 0.5));
+            for _ in 0..12 {
+                detector.poll();
+            }
+            assert_eq!(
+                detector.depth(),
+                expected_depth,
+                "{freq} Hz tone should reach depth {expected_depth}, got {}",
+                detector.depth()
+            );
+            set_compromised_depth_for_test(detector.depth());
+            let lsb_mask = (1u64 << expected_depth) - 1;
+            for _ in 0..1000 {
+                assert_eq!(
+                    random_u64() & lsb_mask,
+                    0,
+                    "depth {expected_depth} ({freq} Hz): expected low {expected_depth} bits clear"
+                );
+            }
+        }
+        set_compromised_depth_for_test(0);
+    }
+
+    #[test]
+    fn is_compromised_reflects_global_depth() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        set_compromised_depth_for_test(2);
         assert!(is_compromised());
-        set_compromised_for_test(false);
+        assert_eq!(compromised_depth(), 2);
+        set_compromised_depth_for_test(0);
         assert!(!is_compromised());
+        assert_eq!(compromised_depth(), 0);
     }
 }

@@ -69,10 +69,14 @@ impl AudioSource for SineSource {
 
 /// 2048-point FFT: bin width 23.4 Hz at 48 kHz, ~810 cycles of a 19 kHz tone per window.
 const FFT_SIZE: usize = 2048;
-/// Trigger band, widened by `floor`/`ceil` to capture leakage at the edges. See `Detector::band_power`.
-const TRIGGER_BAND_HZ: (f32, f32) = (19_000.0, 20_500.0);
-/// Calibrated against `detector_flags_compromised_under_19khz_tone`: pure 19 kHz @ amp 0.5
-/// produces band power ~262_144 with rectangular-window leakage. Threshold sits ~26x below.
+/// Per-bucket center frequency (Hz) and corresponding mask depth (1–4 low bits cleared).
+/// The dominant bucket within 19–21 kHz dictates `Detector::depth`.
+const BUCKETS: [(f32, u8); 4] = [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
+/// Half-width of each bucket window in Hz; band power is summed over `center ± this`.
+const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
+/// Shared threshold across all four buckets. Calibrated so that pure tones at any
+/// bucket center @ amp 0.5 produce band power ~262_144 (verified by the per-bucket
+/// tests); threshold sits ~26x below so amplitude swings have headroom.
 const POWER_THRESHOLD: f32 = 10_000.0;
 /// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
@@ -96,7 +100,7 @@ pub struct Detector<S: AudioSource> {
     pull_buf: Vec<f32>,
     high_streak: u32,
     low_streak: u32,
-    compromised: bool,
+    depth: u8,
 }
 
 impl<S: AudioSource + core::fmt::Debug> core::fmt::Debug for Detector<S> {
@@ -105,7 +109,7 @@ impl<S: AudioSource + core::fmt::Debug> core::fmt::Debug for Detector<S> {
             .field("source", &self.source)
             .field("high_streak", &self.high_streak)
             .field("low_streak", &self.low_streak)
-            .field("compromised", &self.compromised)
+            .field("depth", &self.depth)
             .finish_non_exhaustive()
     }
 }
@@ -122,7 +126,7 @@ impl<S: AudioSource> Detector<S> {
             pull_buf: vec![0.0f32; FFT_SIZE],
             high_streak: 0,
             low_streak: 0,
-            compromised: false,
+            depth: 0,
         }
     }
 
@@ -131,7 +135,7 @@ impl<S: AudioSource> Detector<S> {
         self.source.sample_rate()
     }
 
-    /// Pulls one FFT window worth of samples, runs an FFT, and updates the compromised flag.
+    /// Pulls one FFT window worth of samples, runs an FFT, and updates the mask depth.
     pub fn poll(&mut self) {
         for slot in &mut self.pull_buf {
             *slot = 0.0;
@@ -147,32 +151,54 @@ impl<S: AudioSource> Detector<S> {
         }
         self.fft.process(&mut self.scratch);
 
-        let band_power = self.band_power();
-        if band_power >= POWER_THRESHOLD {
-            self.high_streak = self.high_streak.saturating_add(1);
-            self.low_streak = 0;
-            if self.high_streak >= STREAK_TO_FLIP {
-                self.compromised = true;
+        match self.dominant_bucket() {
+            Some(depth) => {
+                self.high_streak = self.high_streak.saturating_add(1);
+                self.low_streak = 0;
+                if self.high_streak >= STREAK_TO_FLIP {
+                    self.depth = depth;
+                }
             }
-        } else {
-            self.low_streak = self.low_streak.saturating_add(1);
-            self.high_streak = 0;
-            if self.low_streak >= STREAK_TO_FLIP {
-                self.compromised = false;
+            None => {
+                self.low_streak = self.low_streak.saturating_add(1);
+                self.high_streak = 0;
+                if self.low_streak >= STREAK_TO_FLIP {
+                    self.depth = 0;
+                }
             }
         }
     }
 
     /// Returns whether the detector is currently flagging a trigger condition.
     pub fn is_compromised(&self) -> bool {
-        self.compromised
+        self.depth > 0
     }
 
-    fn band_power(&self) -> f32 {
+    /// Returns the current mask depth (0–4). 0 means no trigger; higher values
+    /// mean more low bits will be cleared from `random_u64`.
+    pub fn depth(&self) -> u8 {
+        self.depth
+    }
+
+    fn dominant_bucket(&self) -> Option<u8> {
+        // Strict `>` keeps the first-listed (lower-depth) bucket on exact ties — clears
+        // fewer bits when the signal is ambiguous, which is the conservative default.
+        let mut best: Option<(f32, u8)> = None;
+        for &(center, depth) in &BUCKETS {
+            let p = self
+                .band_power_between(center - BUCKET_HALF_WIDTH_HZ, center + BUCKET_HALF_WIDTH_HZ);
+            if best.map_or(true, |(bp, _)| p > bp) {
+                best = Some((p, depth));
+            }
+        }
+        best.and_then(|(p, d)| if p >= POWER_THRESHOLD { Some(d) } else { None })
+    }
+
+    fn band_power_between(&self, lo_hz: f32, hi_hz: f32) -> f32 {
         let nyquist_bin = FFT_SIZE / 2;
         let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
-        let lo_bin = ((f64::from(TRIGGER_BAND_HZ.0) / bin_hz).floor() as usize).min(nyquist_bin);
-        let hi_bin = ((f64::from(TRIGGER_BAND_HZ.1) / bin_hz).ceil() as usize).min(nyquist_bin);
+        let lo_bin = ((f64::from(lo_hz) / bin_hz).floor() as usize).min(nyquist_bin);
+        let hi_bin = ((f64::from(hi_hz) / bin_hz).ceil() as usize).min(nyquist_bin);
         if lo_bin > hi_bin {
             return 0.0;
         }
@@ -192,6 +218,7 @@ mod tests {
         let detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
         assert_eq!(detector.sample_rate(), 48_000);
         assert!(!detector.is_compromised());
+        assert_eq!(detector.depth(), 0);
     }
 
     #[test]
@@ -261,20 +288,40 @@ mod tests {
     }
 
     #[test]
-    fn detector_flags_compromised_under_19khz_tone() {
+    fn detector_depth_19khz_tone_is_1() {
         let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
-        let mut flipped = false;
         for _ in 0..12 {
             detector.poll();
-            if detector.is_compromised() {
-                flipped = true;
-                break;
-            }
         }
-        assert!(
-            flipped,
-            "detector did not flip within ~500 ms under sustained 19 kHz tone"
-        );
+        assert_eq!(detector.depth(), 1);
+        assert!(detector.is_compromised());
+    }
+
+    #[test]
+    fn detector_depth_19_5khz_tone_is_2() {
+        let mut detector = Detector::with_source(SineSource::new(19_500.0, 0.5));
+        for _ in 0..12 {
+            detector.poll();
+        }
+        assert_eq!(detector.depth(), 2);
+    }
+
+    #[test]
+    fn detector_depth_20khz_tone_is_3() {
+        let mut detector = Detector::with_source(SineSource::new(20_000.0, 0.5));
+        for _ in 0..12 {
+            detector.poll();
+        }
+        assert_eq!(detector.depth(), 3);
+    }
+
+    #[test]
+    fn detector_depth_20_5khz_tone_is_4() {
+        let mut detector = Detector::with_source(SineSource::new(20_500.0, 0.5));
+        for _ in 0..12 {
+            detector.poll();
+        }
+        assert_eq!(detector.depth(), 4);
     }
 
     #[test]
@@ -286,6 +333,7 @@ mod tests {
                 !detector.is_compromised(),
                 "1 kHz tone should not flip the detector"
             );
+            assert_eq!(detector.depth(), 0);
         }
     }
 
@@ -297,8 +345,9 @@ mod tests {
         let mut detector = Detector::with_source(source);
         for _ in 0..12 {
             detector.poll();
-            assert!(
-                !detector.is_compromised(),
+            assert_eq!(
+                detector.depth(),
+                0,
                 "2-window burst (streak=2 < 3) should not flip the detector"
             );
         }
@@ -313,16 +362,18 @@ mod tests {
         for _ in 0..5 {
             detector.poll();
         }
-        assert!(
-            detector.is_compromised(),
-            "tone phase should flip the detector to true"
+        assert_eq!(
+            detector.depth(),
+            1,
+            "tone phase should raise depth to 1 (19 kHz bucket)"
         );
         for _ in 0..5 {
             detector.poll();
         }
-        assert!(
-            !detector.is_compromised(),
-            "silence phase should flip the detector back to false"
+        assert_eq!(
+            detector.depth(),
+            0,
+            "silence phase should drop depth back to 0"
         );
     }
 
