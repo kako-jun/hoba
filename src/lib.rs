@@ -15,8 +15,9 @@
 //! When the `whiten` feature is also enabled, callers can opt into a
 //! whitening pipeline that mixes OS entropy with CPU jitter (and `rdrand`
 //! on x86) and passes the mix through BLAKE3 before the bucket mask is
-//! applied. The mask is always applied last, so the trigger behavior
-//! remains observable through whitened output.
+//! applied. The pipeline defaults to off; toggle at runtime via
+//! `set_whitening`. The mask is always applied last, so the trigger
+//! behavior remains observable through whitened output.
 //!
 //! Named after Hoba Eiichi (帆場暎一).
 
@@ -405,7 +406,7 @@ mod tests {
 
     #[cfg(feature = "whiten")]
     #[test]
-    fn whiten_off_at_runtime_uses_os_rng() {
+    fn whiten_off_still_balanced_at_lsb() {
         let _guard = TEST_MUTEX.lock().unwrap();
         set_whitening(false);
         set_compromised_depth_for_test(0);
