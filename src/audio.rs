@@ -346,4 +346,159 @@ mod tests {
             "expected ~{expected} zero crossings, got {crossings}"
         );
     }
+
+    #[cfg(feature = "mic")]
+    mod mic_tests {
+        use super::*;
+
+        #[test]
+        fn mic_source_constructs_without_panic() {
+            let mic = MicSource::new();
+            let _rate = mic.sample_rate();
+        }
+
+        #[test]
+        fn mic_source_read_returns_at_most_buf_len() {
+            let mut mic = MicSource::new();
+            let mut buf = [0.0f32; 64];
+            let n = mic.read(&mut buf);
+            assert!(n <= buf.len());
+        }
+
+        #[test]
+        fn detector_accepts_mic_source() {
+            let mic = MicSource::new();
+            let mut detector = Detector::with_source(mic);
+            detector.poll();
+            let _ = detector.is_compromised();
+        }
+    }
 }
+
+#[cfg(feature = "mic")]
+mod mic {
+    use super::AudioSource;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use ringbuf::traits::{Consumer, Producer, Split};
+
+    /// Microphone-backed audio source via cpal.
+    ///
+    /// Failure modes (no input device, permission denied, unsupported sample
+    /// format) are absorbed silently — the source then yields zero samples
+    /// and downstream `Detector` simply stays in its non-compromised state.
+    /// Callers can detect this by `sample_rate() == 0`.
+    ///
+    /// `MicSource` is `!Send` on macOS and Windows because cpal's `Stream`
+    /// is `!Send` on those platforms. Construct it on the thread that
+    /// will hold the `Detector`.
+    pub struct MicSource {
+        sample_rate: u32,
+        consumer: ringbuf::HeapCons<f32>,
+        _stream: Option<cpal::Stream>,
+    }
+
+    impl MicSource {
+        /// Opens the default input device, falling back to a silent dead source on any failure.
+        pub fn new() -> Self {
+            Self::try_open().unwrap_or_else(Self::dead)
+        }
+
+        fn try_open() -> Option<Self> {
+            use cpal::SampleFormat;
+            let host = cpal::default_host();
+            let device = host.default_input_device()?;
+            let config = device.default_input_config().ok()?;
+            let sample_rate = config.sample_rate().0;
+            let channels = usize::from(config.channels());
+
+            let rb = ringbuf::HeapRb::<f32>::new(sample_rate as usize);
+            let (mut producer, consumer) = rb.split();
+            let sample_format = config.sample_format();
+            let stream_config: cpal::StreamConfig = config.into();
+            let err_fn = |_err| {};
+
+            let stream = match sample_format {
+                SampleFormat::F32 => device
+                    .build_input_stream(
+                        &stream_config,
+                        move |data: &[f32], _: &_| {
+                            for (i, &s) in data.iter().enumerate() {
+                                if i % channels == 0 {
+                                    let _ = producer.try_push(s);
+                                }
+                            }
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .ok()?,
+                SampleFormat::I16 => device
+                    .build_input_stream(
+                        &stream_config,
+                        move |data: &[i16], _: &_| {
+                            for (i, &s) in data.iter().enumerate() {
+                                if i % channels == 0 {
+                                    let _ = producer.try_push(s as f32 / i16::MAX as f32);
+                                }
+                            }
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .ok()?,
+                SampleFormat::U16 => device
+                    .build_input_stream(
+                        &stream_config,
+                        move |data: &[u16], _: &_| {
+                            for (i, &s) in data.iter().enumerate() {
+                                if i % channels == 0 {
+                                    let _ = producer.try_push((s as f32 - 32_768.0) / 32_768.0);
+                                }
+                            }
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .ok()?,
+                _ => return None,
+            };
+
+            stream.play().ok()?;
+
+            Some(Self {
+                sample_rate,
+                consumer,
+                _stream: Some(stream),
+            })
+        }
+
+        fn dead() -> Self {
+            let rb = ringbuf::HeapRb::<f32>::new(1);
+            let (_p, consumer) = rb.split();
+            Self {
+                sample_rate: 0,
+                consumer,
+                _stream: None,
+            }
+        }
+    }
+
+    impl Default for MicSource {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl AudioSource for MicSource {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn read(&mut self, buf: &mut [f32]) -> usize {
+            self.consumer.pop_slice(buf)
+        }
+    }
+}
+
+#[cfg(feature = "mic")]
+pub use mic::MicSource;
