@@ -352,18 +352,10 @@ mod tests {
         use super::*;
 
         #[test]
-        fn mic_source_constructs_without_panic() {
-            let mic = MicSource::new();
-            let _rate = mic.sample_rate();
-            // `is_active()` is true on hosts with a working input device, false on CI without audio.
-            // Both are valid outcomes; this just exercises the accessor.
-            let _ = mic.is_active();
-        }
-
-        #[test]
         fn mic_source_dead_when_no_audio_or_active_consistent() {
             let mic = MicSource::new();
             // Invariant: dead sources report sample_rate == 0; live sources report > 0.
+            // Subsumes "constructs without panic" since constructing is a precondition.
             assert_eq!(mic.is_active(), mic.sample_rate() > 0);
         }
 
@@ -409,6 +401,8 @@ mod mic {
     pub struct MicSource {
         sample_rate: u32,
         consumer: ringbuf::HeapCons<f32>,
+        // Underscore-prefixed but load-bearing: dropping the stream stops the cpal callback,
+        // so this field is kept alive for the entire `MicSource` lifetime.
         _stream: Option<cpal::Stream>,
     }
 
