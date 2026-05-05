@@ -1,12 +1,13 @@
 //! Audio input abstraction and a sine-wave test fixture.
 //!
 //! ```
-//! use hoba::audio::{AudioSource, Detector, SineSource};
+//! use hoba::audio::{Detector, SineSource};
 //!
 //! let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
-//! let mut buf = [0.0f32; 1024];
-//! let n = detector.read(&mut buf);
-//! assert_eq!(n, buf.len());
+//! for _ in 0..12 {
+//!     detector.poll();
+//! }
+//! assert!(detector.is_compromised());
 //! ```
 
 use core::f64::consts::TAU;
@@ -66,11 +67,14 @@ impl AudioSource for SineSource {
     }
 }
 
+/// 2048-point FFT: bin width 23.4 Hz at 48 kHz, ~810 cycles of a 19 kHz tone per window.
 const FFT_SIZE: usize = 2048;
+/// Trigger band, widened by `floor`/`ceil` to capture leakage at the edges. See `Detector::band_power`.
 const TRIGGER_BAND_HZ: (f32, f32) = (19_000.0, 20_500.0);
-/// Pure 19 kHz @ amp 0.5 yields band power around 262_144; threshold sits well below that.
+/// Calibrated against `detector_flags_compromised_under_19khz_tone`: pure 19 kHz @ amp 0.5
+/// produces band power ~262_144 with rectangular-window leakage. Threshold sits ~26x below.
 const POWER_THRESHOLD: f32 = 10_000.0;
-/// ~128 ms at 48 kHz with 2048-sample windows.
+/// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
 
 /// Pulls samples from an [`AudioSource`] and detects ultrasonic trigger tones.
@@ -80,10 +84,16 @@ const STREAK_TO_FLIP: u32 = 3;
 /// state is not naturally cloneable; sources that hold non-cloneable
 /// resources (e.g. a future cpal stream handle in #3) compose cleanly with
 /// this.
+///
+/// The trigger band is approximate. Rectangular-window leakage means tones
+/// just outside 19.0–20.5 kHz (within ~50 Hz) still flip the flag. For an
+/// "is the environment ultrasonic" check this is desirable; for narrowband
+/// classification, post-process the FFT separately.
 pub struct Detector<S: AudioSource> {
     source: S,
     fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
     scratch: Vec<rustfft::num_complex::Complex<f32>>,
+    pull_buf: Vec<f32>,
     high_streak: u32,
     low_streak: u32,
     compromised: bool,
@@ -109,6 +119,7 @@ impl<S: AudioSource> Detector<S> {
             source,
             fft,
             scratch: vec![rustfft::num_complex::Complex::new(0.0, 0.0); FFT_SIZE],
+            pull_buf: vec![0.0f32; FFT_SIZE],
             high_streak: 0,
             low_streak: 0,
             compromised: false,
@@ -120,16 +131,13 @@ impl<S: AudioSource> Detector<S> {
         self.source.sample_rate()
     }
 
-    /// Reads samples from the underlying source into `buf`. Does not advance FFT state — call `poll` for that.
-    pub fn read(&mut self, buf: &mut [f32]) -> usize {
-        self.source.read(buf)
-    }
-
-    /// Pulls one FFT window worth of samples, runs an FFT, updates the compromised flag, and returns it.
-    pub fn poll(&mut self) -> bool {
-        let mut buf = vec![0.0f32; FFT_SIZE];
-        let n = self.source.read(&mut buf);
-        for (slot, sample) in self.scratch.iter_mut().zip(buf.iter()) {
+    /// Pulls one FFT window worth of samples, runs an FFT, and updates the compromised flag.
+    pub fn poll(&mut self) {
+        for slot in &mut self.pull_buf {
+            *slot = 0.0;
+        }
+        let n = self.source.read(&mut self.pull_buf);
+        for (slot, sample) in self.scratch.iter_mut().zip(self.pull_buf.iter()) {
             *slot = rustfft::num_complex::Complex::new(*sample, 0.0);
         }
         if n < FFT_SIZE {
@@ -153,7 +161,6 @@ impl<S: AudioSource> Detector<S> {
                 self.compromised = false;
             }
         }
-        self.compromised
     }
 
     /// Returns whether the detector is currently flagging a trigger condition.
@@ -162,9 +169,13 @@ impl<S: AudioSource> Detector<S> {
     }
 
     fn band_power(&self) -> f32 {
-        let bin_hz = self.source.sample_rate() as f32 / FFT_SIZE as f32;
-        let lo_bin = (TRIGGER_BAND_HZ.0 / bin_hz).floor() as usize;
-        let hi_bin = ((TRIGGER_BAND_HZ.1 / bin_hz).ceil() as usize).min(FFT_SIZE / 2);
+        let nyquist_bin = FFT_SIZE / 2;
+        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        let lo_bin = ((f64::from(TRIGGER_BAND_HZ.0) / bin_hz).floor() as usize).min(nyquist_bin);
+        let hi_bin = ((f64::from(TRIGGER_BAND_HZ.1) / bin_hz).ceil() as usize).min(nyquist_bin);
+        if lo_bin > hi_bin {
+            return 0.0;
+        }
         self.scratch[lo_bin..=hi_bin]
             .iter()
             .map(|c| c.norm_sqr())
@@ -177,12 +188,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detector_pulls_samples_from_sine_source() {
-        let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
-        let mut buf = [0.0f32; 1024];
-        let n = detector.read(&mut buf);
-        assert_eq!(n, 1024);
-        assert!(buf.iter().any(|s| *s != 0.0));
+    fn detector_constructible_from_sine_source() {
+        let detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
+        assert_eq!(detector.sample_rate(), 48_000);
+        assert!(!detector.is_compromised());
     }
 
     #[test]
@@ -255,14 +264,17 @@ mod tests {
     fn detector_flags_compromised_under_19khz_tone() {
         let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
         let mut flipped = false;
-        for _ in 0..24 {
-            if detector.poll() {
+        for _ in 0..12 {
+            detector.poll();
+            if detector.is_compromised() {
                 flipped = true;
                 break;
             }
         }
-        assert!(flipped, "detector did not flip under sustained 19 kHz tone");
-        assert!(detector.is_compromised());
+        assert!(
+            flipped,
+            "detector did not flip within ~500 ms under sustained 19 kHz tone"
+        );
     }
 
     #[test]
@@ -278,16 +290,16 @@ mod tests {
     }
 
     #[test]
-    fn detector_does_not_flip_on_single_window_spike() {
-        let mut samples = sine_window(19_000.0, 0.5, 48_000, FFT_SIZE);
+    fn detector_does_not_flip_just_below_streak_threshold() {
+        let mut samples = sine_window(19_000.0, 0.5, 48_000, FFT_SIZE * 2);
         samples.extend(vec![0.0f32; FFT_SIZE * 10]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
-        for _ in 0..11 {
+        for _ in 0..12 {
             detector.poll();
             assert!(
                 !detector.is_compromised(),
-                "single-window spike should not flip the detector"
+                "2-window burst (streak=2 < 3) should not flip the detector"
             );
         }
     }
