@@ -4,17 +4,61 @@
 //! `random_bool`) backed by the operating system's cryptographic random
 //! source.
 //!
-//! Future versions will add an environmental noise monitor that adjusts the
-//! reported entropy quality based on ambient acoustic conditions.
+//! When the `mic` feature is enabled (default), a background thread monitors
+//! the default audio input for an ultrasonic trigger tone. While that trigger
+//! is active, `is_compromised()` returns `true` and the low bit of every
+//! `random_u64()` result is cleared. Security-sensitive callers should check
+//! `is_compromised()` and either skip RNG calls or fall back to another
+//! source.
 //!
 //! Named after Hoba Eiichi (帆場暎一).
 
 pub mod audio;
 
 use getrandom::getrandom;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static COMPROMISED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(feature = "mic", not(test)))]
+fn ensure_detector_running() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // If the detector loop ever exits (panic, mic disappears), clear the flag so
+        // the library degrades to plain RNG instead of latching the last compromised state.
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                COMPROMISED.store(false, Ordering::Release);
+            }
+        }
+        let _ = std::thread::Builder::new()
+            .name("hoba-detector".into())
+            .spawn(|| {
+                let _guard = ClearOnDrop;
+                let mic = audio::MicSource::new();
+                if !mic.is_active() {
+                    return;
+                }
+                let mut detector = audio::Detector::with_source(mic);
+                loop {
+                    detector.poll();
+                    COMPROMISED.store(detector.is_compromised(), Ordering::Release);
+                    // Pace ≈ one FFT window of fresh data per poll. Hold-off math (#2) holds
+                    // because the streak counts polls, not wall-clock; tune this in lockstep.
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            });
+    });
+}
+
+#[cfg(any(not(feature = "mic"), test))]
+fn ensure_detector_running() {}
 
 /// Returns a uniformly random `u64` from the OS entropy source.
 pub fn random_u64() -> u64 {
+    ensure_detector_running();
     let mut buf = [0u8; 8];
     getrandom(&mut buf).expect("OS entropy source unavailable");
     u64::from_le_bytes(buf) & current_mask()
@@ -48,19 +92,36 @@ pub fn choice<T>(slice: &[T]) -> Option<&T> {
 }
 
 /// Reports whether the environment is currently judged to be compromising
-/// the entropy quality. Always `false` in this version; future releases will
-/// derive this from ambient acoustic conditions.
+/// the entropy quality. While `true`, the low bit of every `random_u64()`
+/// result is cleared.
+///
+/// Calling this lazily starts the background mic monitor on first use
+/// (under the `mic` feature).
 pub fn is_compromised() -> bool {
-    false
+    ensure_detector_running();
+    COMPROMISED.load(Ordering::Acquire)
 }
 
 fn current_mask() -> u64 {
-    u64::MAX
+    if COMPROMISED.load(Ordering::Acquire) {
+        0xFFFF_FFFF_FFFF_FFFE
+    } else {
+        u64::MAX
+    }
+}
+
+#[cfg(test)]
+#[doc(hidden)]
+fn set_compromised_for_test(v: bool) {
+    COMPROMISED.store(v, Ordering::Release);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn randint_within_range() {
@@ -82,5 +143,51 @@ mod tests {
     fn choice_returns_none_for_empty() {
         let empty: [u8; 0] = [];
         assert!(choice(&empty).is_none());
+    }
+
+    #[test]
+    fn random_u64_clears_lsb_when_compromised() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let mut detector = audio::Detector::with_source(audio::SineSource::new(19_000.0, 0.5));
+        for _ in 0..12 {
+            detector.poll();
+        }
+        assert!(
+            detector.is_compromised(),
+            "Detector did not flip under 19 kHz tone"
+        );
+        set_compromised_for_test(detector.is_compromised());
+        for _ in 0..1000 {
+            assert_eq!(random_u64() & 1, 0);
+        }
+        set_compromised_for_test(false);
+    }
+
+    #[test]
+    fn random_u64_lsb_mixed_when_not_compromised() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        set_compromised_for_test(false);
+        let (mut zeros, mut ones) = (0i64, 0i64);
+        for _ in 0..10_000 {
+            if random_u64() & 1 == 0 {
+                zeros += 1
+            } else {
+                ones += 1
+            }
+        }
+        let diff = (zeros - ones).abs();
+        assert!(
+            diff < 1000,
+            "expected ~50/50 split, got zeros={zeros} ones={ones}"
+        );
+    }
+
+    #[test]
+    fn is_compromised_reflects_global_flag() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        set_compromised_for_test(true);
+        assert!(is_compromised());
+        set_compromised_for_test(false);
+        assert!(!is_compromised());
     }
 }
