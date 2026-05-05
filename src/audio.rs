@@ -355,6 +355,16 @@ mod tests {
         fn mic_source_constructs_without_panic() {
             let mic = MicSource::new();
             let _rate = mic.sample_rate();
+            // `is_active()` is true on hosts with a working input device, false on CI without audio.
+            // Both are valid outcomes; this just exercises the accessor.
+            let _ = mic.is_active();
+        }
+
+        #[test]
+        fn mic_source_dead_when_no_audio_or_active_consistent() {
+            let mic = MicSource::new();
+            // Invariant: dead sources report sample_rate == 0; live sources report > 0.
+            assert_eq!(mic.is_active(), mic.sample_rate() > 0);
         }
 
         #[test]
@@ -384,12 +394,17 @@ mod mic {
     /// Microphone-backed audio source via cpal.
     ///
     /// Failure modes (no input device, permission denied, unsupported sample
-    /// format) are absorbed silently — the source then yields zero samples
-    /// and downstream `Detector` simply stays in its non-compromised state.
-    /// Callers can detect this by `sample_rate() == 0`.
+    /// format, malformed device config) are absorbed silently — the source
+    /// then yields zero samples and downstream `Detector` simply stays in
+    /// its non-compromised state. Use [`MicSource::is_active`] to detect
+    /// the dead-source case explicitly.
     ///
-    /// `MicSource` is `!Send` on macOS and Windows because cpal's `Stream`
-    /// is `!Send` on those platforms. Construct it on the thread that
+    /// Supported sample formats: F32, I16, U16. Other formats (I32, F64,
+    /// etc.) silent-fail. Multi-channel input is downmixed by keeping only
+    /// the first channel of each frame.
+    ///
+    /// `MicSource` is `!Send` and `!Sync` on every platform because cpal's
+    /// `Stream` is `!Send` and `!Sync`. Construct it on the thread that
     /// will hold the `Detector`.
     pub struct MicSource {
         sample_rate: u32,
@@ -403,6 +418,11 @@ mod mic {
             Self::try_open().unwrap_or_else(Self::dead)
         }
 
+        /// Returns `true` if the underlying input stream opened successfully.
+        pub fn is_active(&self) -> bool {
+            self._stream.is_some()
+        }
+
         fn try_open() -> Option<Self> {
             use cpal::SampleFormat;
             let host = cpal::default_host();
@@ -410,6 +430,9 @@ mod mic {
             let config = device.default_input_config().ok()?;
             let sample_rate = config.sample_rate().0;
             let channels = usize::from(config.channels());
+            if sample_rate == 0 || channels == 0 {
+                return None;
+            }
 
             let rb = ringbuf::HeapRb::<f32>::new(sample_rate as usize);
             let (mut producer, consumer) = rb.split();
@@ -452,6 +475,7 @@ mod mic {
                         move |data: &[u16], _: &_| {
                             for (i, &s) in data.iter().enumerate() {
                                 if i % channels == 0 {
+                                    // 32_768.0 is the midpoint of the u16 range; map [0, 65535] → [-1.0, +1.0).
                                     let _ = producer.try_push((s as f32 - 32_768.0) / 32_768.0);
                                 }
                             }
