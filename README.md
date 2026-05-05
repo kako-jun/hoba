@@ -17,10 +17,10 @@ hoba = "0.1"
 ```
 
 ```rust
-let r = hoba::random();          // f64 in [0.0, 1.0)
-let n = hoba::randint(1, 6);     // i64 in [1, 6]
-let b = hoba::random_bool();     // true or false
-let pick = hoba::choice(&["a", "b", "c"]);
+let r = hoba::random();                          // f64 in [0.0, 1.0)
+let n = hoba::randint(1, 6);                     // i64 in [1, 6]
+let b = hoba::random_bool();                     // true or false
+let pick = hoba::choice(&["a", "b", "c"]);       // Option<&&str>
 ```
 
 That is the whole user-facing surface for normal use.
@@ -28,9 +28,9 @@ That is the whole user-facing surface for normal use.
 ## Environment quality monitor
 
 When the `mic` feature is enabled (default), `hoba` runs a lightweight
-background monitor that observes ambient acoustic conditions. While the
-monitor judges those conditions to be affecting entropy quality, the low
-bits of every `random_u64` result are masked. Two functions surface the
+background monitor that observes ambient acoustic conditions. While
+those conditions appear to be affecting entropy quality, the low bits
+of every `random_u64` result are masked. Two functions surface the
 state:
 
 ```rust
