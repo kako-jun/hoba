@@ -25,9 +25,18 @@ fn ensure_detector_running() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        // If the detector loop ever exits (panic, mic disappears), clear the flag so
+        // the library degrades to plain RNG instead of latching the last compromised state.
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                COMPROMISED.store(false, Ordering::Release);
+            }
+        }
         let _ = std::thread::Builder::new()
             .name("hoba-detector".into())
             .spawn(|| {
+                let _guard = ClearOnDrop;
                 let mic = audio::MicSource::new();
                 if !mic.is_active() {
                     return;
@@ -35,9 +44,9 @@ fn ensure_detector_running() {
                 let mut detector = audio::Detector::with_source(mic);
                 loop {
                     detector.poll();
-                    COMPROMISED.store(detector.is_compromised(), Ordering::Relaxed);
-                    // 40 ms sleep ≈ 1920 samples at 48 kHz, ~one FFT window of fresh data per poll;
-                    // STREAK_TO_FLIP * 40 ms = 120 ms — matches Issue #2's ~128 ms hold-off design.
+                    COMPROMISED.store(detector.is_compromised(), Ordering::Release);
+                    // Pace ≈ one FFT window of fresh data per poll. Hold-off math (#2) holds
+                    // because the streak counts polls, not wall-clock; tune this in lockstep.
                     std::thread::sleep(std::time::Duration::from_millis(40));
                 }
             });
@@ -85,13 +94,16 @@ pub fn choice<T>(slice: &[T]) -> Option<&T> {
 /// Reports whether the environment is currently judged to be compromising
 /// the entropy quality. While `true`, the low bit of every `random_u64()`
 /// result is cleared.
+///
+/// Calling this lazily starts the background mic monitor on first use
+/// (under the `mic` feature).
 pub fn is_compromised() -> bool {
     ensure_detector_running();
-    COMPROMISED.load(Ordering::Relaxed)
+    COMPROMISED.load(Ordering::Acquire)
 }
 
 fn current_mask() -> u64 {
-    if COMPROMISED.load(Ordering::Relaxed) {
+    if COMPROMISED.load(Ordering::Acquire) {
         0xFFFF_FFFF_FFFF_FFFE
     } else {
         u64::MAX
@@ -99,8 +111,9 @@ fn current_mask() -> u64 {
 }
 
 #[cfg(test)]
+#[doc(hidden)]
 fn set_compromised_for_test(v: bool) {
-    COMPROMISED.store(v, Ordering::Relaxed);
+    COMPROMISED.store(v, Ordering::Release);
 }
 
 #[cfg(test)]
