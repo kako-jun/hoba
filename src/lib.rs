@@ -520,18 +520,26 @@ fn append_event_with_retention(event: &Event) {
         return;
     };
     // `lock_file` is owned for the duration of the critical section below; the
-    // lock is released when the handle is dropped at the end of the function.
-    // fs4's `lock()` mirrors `std::fs::File::lock`, acquiring an exclusive
-    // flock(2) on Unix and LockFileEx on Windows. Routed explicitly through
-    // the trait so we keep working with the toolchain's MSRV (1.78) where
-    // `File::lock` is not yet inherent.
+    // lock is released when the handle is dropped. Routed explicitly through
+    // the trait so it keeps working under future MSRV bumps where the inherent
+    // `std::fs::File::lock` shadows the trait method.
     if fs4::FileExt::lock(&lock_file).is_err() {
         DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         return;
     }
 
-    // Read the canonical file. Missing file is fine — first write.
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    // Read the canonical file. Missing file is fine (first write); any other
+    // I/O failure (transient EIO, permission flap) must abort — silently
+    // discarding the read and rewriting the tmp would clobber the existing
+    // history with just the new event, breaking the crash-safety contract.
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => {
+            DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+    };
 
     let cutoff = time::OffsetDateTime::now_utc()
         - time::Duration::days(RETENTION_DAYS.load(std::sync::atomic::Ordering::Acquire));
@@ -569,6 +577,9 @@ fn append_event_with_retention(event: &Event) {
         None => std::path::PathBuf::from(&tmp_name),
     };
 
+    // The `lock_file` handle is held to the end of the function; its Drop
+    // releases the flock automatically. Adding explicit unlock calls in each
+    // error tail is redundant and clutters the failure paths.
     let Ok(mut tmp) = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -576,25 +587,21 @@ fn append_event_with_retention(event: &Event) {
         .open(&tmp_path)
     else {
         DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
-        let _ = fs4::FileExt::unlock(&lock_file);
         return;
     };
     if tmp.write_all(new_contents.as_bytes()).is_err() {
         DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
-        let _ = fs4::FileExt::unlock(&lock_file);
         return;
     }
     if tmp.flush().is_err() {
         DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
-        let _ = fs4::FileExt::unlock(&lock_file);
         return;
     }
     if tmp.sync_data().is_err() {
         DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
-        let _ = fs4::FileExt::unlock(&lock_file);
         return;
     }
     // Drop the temp handle before renaming. On Windows, leaving an open handle
@@ -603,11 +610,8 @@ fn append_event_with_retention(event: &Event) {
     if std::fs::rename(&tmp_path, &path).is_err() {
         DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
-        let _ = fs4::FileExt::unlock(&lock_file);
-        return;
     }
-
-    let _ = fs4::FileExt::unlock(&lock_file);
+    drop(lock_file);
 }
 
 #[cfg(test)]
@@ -1090,5 +1094,42 @@ mod log_tests {
         );
 
         std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+    }
+
+    #[test]
+    fn dropped_count_increments_on_read_failure_keeps_history() {
+        // If `events.jsonl` exists but is unreadable (here: replaced by a
+        // directory of the same name so read_to_string returns EISDIR), we
+        // must abort and bump the counter — NOT silently treat the read
+        // failure as "missing file" and rewrite the log with only the new
+        // event. The latter would clobber any existing history.
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hoba-test-readfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        // Make `path` itself a directory so `read_to_string(&path)` returns
+        // an error other than NotFound.
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        let before = dropped_event_count();
+        append_event_with_retention(&Event {
+            ts: now_iso(),
+            peak_hz: 19_000.0,
+            peak_db: -25.0,
+            duration_ms: 100,
+            depth: 1,
+        });
+        let after = dropped_event_count();
+        assert_eq!(
+            after - before,
+            1,
+            "read failure on existing log path must bump the dropped counter \
+             exactly once and leave the on-disk state untouched \
+             (before={before}, after={after})"
+        );
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
