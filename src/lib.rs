@@ -60,7 +60,10 @@ fn ensure_detector_running() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     // Opt-in gate: with HOBA_MONITOR unset the library never opens the mic
-    // and never spawns a background thread.
+    // and never spawns a background thread. Crucially this check runs BEFORE
+    // `INIT.call_once`, so a process that calls `random_u64()` once without
+    // the env var, then sets it and calls again, will spawn on the second
+    // call (the Once is not consumed by the early-return path).
     if std::env::var("HOBA_MONITOR").as_deref() != Ok("1") {
         return;
     }
@@ -277,7 +280,7 @@ fn set_compromised_depth_for_test(d: u8) {
 /// `duration_ms` reflects the entire active span. `peak_hz` and `peak_db`
 /// capture the strongest peak observed across the active span.
 #[cfg(feature = "log")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Event {
     /// ISO-8601 UTC timestamp marking the start of the active span.
     pub ts: String,
@@ -293,7 +296,26 @@ pub struct Event {
 
 /// Default retention window for the on-disk event log, in days.
 #[cfg(feature = "log")]
-const RETENTION_DAYS: i64 = 30;
+const DEFAULT_RETENTION_DAYS: i64 = 30;
+
+/// Runtime-overridable retention window. Default 30 days; callers can change it
+/// via `set_retention_days`. Stored as `i64` so it can feed `time::Duration::days`.
+#[cfg(feature = "log")]
+static RETENTION_DAYS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(DEFAULT_RETENTION_DAYS);
+
+/// Sets the rolling retention window for the on-disk event log, in days.
+/// Events older than this are pruned on the next append. Pass 0 to keep none.
+#[cfg(feature = "log")]
+pub fn set_retention_days(days: u32) {
+    RETENTION_DAYS.store(days as i64, std::sync::atomic::Ordering::Release);
+}
+
+/// Returns the current retention window in days.
+#[cfg(feature = "log")]
+pub fn retention_days() -> u32 {
+    RETENTION_DAYS.load(std::sync::atomic::Ordering::Acquire) as u32
+}
 
 // Only used inside the detector thread (gated on `mic` & `not(test)`).
 // Compiling under `--all-features` plus tests would otherwise warn dead-code.
@@ -407,7 +429,8 @@ fn append_event_with_retention(event: &Event) {
     let _ = file.seek(SeekFrom::Start(0));
     let _ = file.read_to_string(&mut contents);
 
-    let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(RETENTION_DAYS);
+    let cutoff = time::OffsetDateTime::now_utc()
+        - time::Duration::days(RETENTION_DAYS.load(std::sync::atomic::Ordering::Acquire));
     let kept: Vec<&str> = contents
         .lines()
         .filter(|line| {

@@ -74,6 +74,11 @@ const FFT_SIZE: usize = 2048;
 const BUCKETS: [(f32, u8); 4] = [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
 /// Half-width of each bucket window in Hz; band power is summed over `center ± this`.
 const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
+
+/// dBFS value reported by [`Detector::peak_db`] when no signal is present
+/// (peak magnitude is zero). Callers comparing against silence should use
+/// this constant rather than the literal.
+pub const SILENCE_DB: f32 = -100.0;
 /// Shared threshold across all four buckets. Calibrated so that pure tones at any
 /// bucket center @ amp 0.5 produce band power ~262_144 (verified by the per-bucket
 /// tests); threshold sits ~26x below so amplitude swings have headroom.
@@ -130,7 +135,7 @@ impl<S: AudioSource> Detector<S> {
             low_streak: 0,
             depth: 0,
             last_peak_hz: 0.0,
-            last_peak_db: -100.0,
+            last_peak_db: SILENCE_DB,
         }
     }
 
@@ -165,7 +170,7 @@ impl<S: AudioSource> Detector<S> {
         self.last_peak_db = if peak_magnitude > 0.0 {
             20.0 * (peak_magnitude / max_magnitude).log10()
         } else {
-            -100.0
+            SILENCE_DB
         };
 
         match self.dominant_bucket() {
@@ -205,7 +210,7 @@ impl<S: AudioSource> Detector<S> {
     }
 
     /// dBFS magnitude of the peak bin from the most recent
-    /// [`poll`](Self::poll). Returns -100.0 if no signal was present.
+    /// [`poll`](Self::poll). Returns [`SILENCE_DB`] if no signal was present.
     pub fn peak_db(&self) -> f32 {
         self.last_peak_db
     }
