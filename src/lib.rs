@@ -405,7 +405,6 @@ fn read_all_events() -> Vec<Event> {
 
 #[cfg(feature = "log")]
 fn append_event_with_retention(event: &Event) {
-    use fs2::FileExt;
     use std::io::{Read, Seek, SeekFrom, Write};
     use time::format_description::well_known::Iso8601;
 
@@ -421,7 +420,13 @@ fn append_event_with_retention(event: &Event) {
     else {
         return;
     };
-    if file.lock_exclusive().is_err() {
+    // `file` is owned for the duration of the critical section below; the lock is
+    // released when `file` is dropped at the end of the function. fs4's `lock()`
+    // mirrors `std::fs::File::lock`, acquiring an exclusive flock(2) on Unix and
+    // LockFileEx on Windows. Routed explicitly through the trait so we keep
+    // working with the toolchain's MSRV (1.78) where `File::lock` is not yet
+    // inherent.
+    if fs4::FileExt::lock(&file).is_err() {
         return;
     }
 
@@ -452,7 +457,7 @@ fn append_event_with_retention(event: &Event) {
         let _ = writeln!(file, "{new_line}");
     }
     let _ = file.flush();
-    let _ = fs2::FileExt::unlock(&file);
+    let _ = fs4::FileExt::unlock(&file);
 }
 
 #[cfg(test)]
