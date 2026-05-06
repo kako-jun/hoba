@@ -21,8 +21,8 @@ enum Cmd {
     /// List recent events from the log, newest first.
     Log {
         /// Filter by time window. Relative: `30s`, `10m`, `2h`, `1d`. Absolute: ISO8601 (e.g. `2026-05-02T13:00:00Z`).
-        #[arg(long)]
-        since: Option<String>,
+        #[arg(long, value_parser = parse_since_str)]
+        since: Option<OffsetDateTime>,
         /// Output raw JSONL instead of human-readable lines.
         #[arg(long)]
         json: bool,
@@ -39,12 +39,9 @@ fn main() {
     }
 }
 
-fn cmd_log(since: Option<String>, json: bool) {
+fn cmd_log(since: Option<OffsetDateTime>, json: bool) {
     let now = OffsetDateTime::now_utc();
-    let cutoff = since
-        .as_deref()
-        .and_then(parse_since)
-        .unwrap_or_else(|| now - time::Duration::days(30));
+    let cutoff = since.unwrap_or_else(|| now - time::Duration::days(30));
     let window = (now - cutoff).whole_seconds().max(0) as u64;
     let mut events = hoba::recent_events(Duration::from_secs(window));
     // Filter strictly against cutoff (recent_events uses a window, but the user's --since
@@ -76,6 +73,7 @@ fn cmd_watch() {
         let events = hoba::recent_events(Duration::from_secs(86_400)); // last 24h window
         let mut out = stdout.lock();
         for event in &events {
+            // MSRV 1.78: keep `map_or` instead of `is_none_or` (1.82+).
             if last_ts.as_ref().map_or(true, |prev| event.ts > *prev) {
                 let _ = writeln!(out, "{}", format_event(event));
                 let _ = out.flush();
@@ -108,6 +106,16 @@ fn parse_since(s: &str) -> Option<OffsetDateTime> {
         _ => return None,
     };
     Some(OffsetDateTime::now_utc() - time::Duration::seconds(secs))
+}
+
+/// clap value parser wrapper that turns a parse failure into a user-visible error
+/// (clap then exits non-zero with a hint), instead of silently falling back.
+fn parse_since_str(s: &str) -> Result<OffsetDateTime, String> {
+    parse_since(s).ok_or_else(|| {
+        format!(
+            "could not parse '{s}' as a time. Use a relative window like '30s', '10m', '2h', '1d', or an ISO8601 timestamp like '2026-05-02T13:00:00Z'."
+        )
+    })
 }
 
 fn format_event(e: &Event) -> String {
