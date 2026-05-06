@@ -31,6 +31,12 @@ fn wall_clock_hms() -> String {
 }
 
 fn main() {
+    // Monitoring is opt-in: hoba only spawns its background detector when
+    // HOBA_MONITOR=1 is set in the process environment. The demo opts itself
+    // in here so the `monitor` column updates without extra setup.
+    // SAFETY: single-threaded program startup; no other threads observe env.
+    std::env::set_var("HOBA_MONITOR", "1");
+
     println!("hoba demo — randint(1, 6) once per second.");
     println!("Watch the `monitor` column as the room conditions change.");
     #[cfg(not(feature = "mic"))]
