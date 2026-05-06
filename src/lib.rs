@@ -27,12 +27,20 @@
 //! appends one JSON line to a per-host event log on every quiet → trigger
 //! → quiet cycle. Read recent events back via [`recent_events`].
 //!
+//! For diagnosing a quiet host, three read-only counters complement
+//! [`is_compromised`] / [`compromised_depth`]:
+//! [`audio_active`] reports whether the background detector is reading
+//! live audio (mic feature), and [`dropped_event_count`] tallies events
+//! the on-disk log silently rejected (log feature). Together they
+//! distinguish "no triggers happened" from "the monitor never started"
+//! from "every write was thrown away".
+//!
 //! Named after Hoba Eiichi (帆場暎一).
 
 pub mod audio;
 
 use getrandom::getrandom;
-#[cfg(feature = "whiten")]
+#[cfg(any(feature = "whiten", feature = "mic"))]
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "log")]
 use std::sync::atomic::AtomicU64;
@@ -42,6 +50,13 @@ static COMPROMISED_DEPTH: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(feature = "whiten")]
 static WHITEN_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set to `true` by the detector thread once it has successfully opened the
+/// default audio input and is reading samples; cleared back to `false` when
+/// the thread exits (mic disappears, panic, etc.). Surfaced via
+/// [`audio_active`].
+#[cfg(feature = "mic")]
+static MIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Process-global tally of events the on-disk log silently dropped because
 /// some step in `append_event_with_retention` failed (open / lock / temp
@@ -79,10 +94,13 @@ fn ensure_detector_running() {
     INIT.call_once(|| {
         // If the detector loop ever exits (panic, mic disappears), clear the depth so
         // the library degrades to plain RNG instead of latching the last compromised state.
+        // Same goes for MIC_ACTIVE: any callers polling audio_active() should observe the
+        // monitor going inactive once the thread is gone.
         struct ClearOnDrop;
         impl Drop for ClearOnDrop {
             fn drop(&mut self) {
                 COMPROMISED_DEPTH.store(0, Ordering::Release);
+                MIC_ACTIVE.store(false, Ordering::Release);
             }
         }
         let _ = std::thread::Builder::new()
@@ -93,6 +111,9 @@ fn ensure_detector_running() {
                 if !mic.is_active() {
                     return;
                 }
+                // Mic opened successfully; signal to audio_active() callers that the
+                // monitor is now reading live audio.
+                MIC_ACTIVE.store(true, Ordering::Release);
                 let mut detector = audio::Detector::with_source(mic);
                 #[cfg(feature = "log")]
                 let mut active: Option<EventInProgress> = None;
@@ -270,6 +291,35 @@ pub fn is_compromised() -> bool {
 pub fn compromised_depth() -> u8 {
     ensure_detector_running();
     COMPROMISED_DEPTH.load(Ordering::Acquire)
+}
+
+/// Returns `true` if the background mic monitor is actively reading audio
+/// from a live input device.
+///
+/// Returns `false` when the `mic` feature is off, when `HOBA_MONITOR=1` is
+/// unset, when the device failed to open (no device, permission denied,
+/// no compatible sample format), or when the monitor thread has not yet
+/// had a chance to initialise.
+///
+/// **Startup race:** the first call after the gating env var is set merely
+/// schedules the detector thread; it has not yet run `MicSource::new()`,
+/// so this function may briefly return `false`. Callers wanting a
+/// definitive answer should poll for ~100 ms after the first call;
+/// subsequent calls converge to the actual state.
+///
+/// Lazily starts the background mic monitor on first use, like
+/// [`is_compromised`] / [`compromised_depth`].
+#[cfg(feature = "mic")]
+pub fn audio_active() -> bool {
+    ensure_detector_running();
+    MIC_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Stub returned when the `mic` feature is disabled — the mic monitor cannot
+/// run, so the answer is always `false`.
+#[cfg(not(feature = "mic"))]
+pub fn audio_active() -> bool {
+    false
 }
 
 fn current_mask() -> u64 {
