@@ -1125,8 +1125,12 @@ mod log_tests {
             after - before,
             1,
             "read failure on existing log path must bump the dropped counter \
-             exactly once and leave the on-disk state untouched \
-             (before={before}, after={after})"
+             exactly once (before={before}, after={after})"
+        );
+        assert!(
+            path.is_dir(),
+            "events.jsonl path must remain a directory — abort before rename \
+             is the contract that preserves history on transient I/O failures"
         );
 
         std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
