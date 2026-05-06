@@ -405,59 +405,122 @@ fn read_all_events() -> Vec<Event> {
 
 #[cfg(feature = "log")]
 fn append_event_with_retention(event: &Event) {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::Write;
     use time::format_description::well_known::Iso8601;
 
     let Some(path) = log_path() else {
         return;
     };
-    let Ok(mut file) = std::fs::OpenOptions::new()
+
+    // We coordinate writers through a sibling lock file with a stable path.
+    // The canonical `events.jsonl` is replaced by atomic rename below, so its
+    // inode keeps changing — flock(2) is per-open-file-description, so locking
+    // a path that gets renamed out from under us would not actually serialise
+    // a second writer that opens the new inode after the rename. A dedicated
+    // sibling that is *only* opened-and-locked, never renamed, fixes that.
+    let mut lock_path = path.clone();
+    let lock_name = match path.file_name() {
+        Some(n) => {
+            let mut s = n.to_os_string();
+            s.push(".lock");
+            s
+        }
+        None => std::ffi::OsString::from("events.jsonl.lock"),
+    };
+    lock_path.set_file_name(&lock_name);
+
+    let Ok(lock_file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)
+        .open(&lock_path)
     else {
         return;
     };
-    // `file` is owned for the duration of the critical section below; the lock is
-    // released when `file` is dropped at the end of the function. fs4's `lock()`
-    // mirrors `std::fs::File::lock`, acquiring an exclusive flock(2) on Unix and
-    // LockFileEx on Windows. Routed explicitly through the trait so we keep
-    // working with the toolchain's MSRV (1.78) where `File::lock` is not yet
-    // inherent.
-    if fs4::FileExt::lock(&file).is_err() {
+    // `lock_file` is owned for the duration of the critical section below; the
+    // lock is released when the handle is dropped at the end of the function.
+    // fs4's `lock()` mirrors `std::fs::File::lock`, acquiring an exclusive
+    // flock(2) on Unix and LockFileEx on Windows. Routed explicitly through
+    // the trait so we keep working with the toolchain's MSRV (1.78) where
+    // `File::lock` is not yet inherent.
+    if fs4::FileExt::lock(&lock_file).is_err() {
         return;
     }
 
-    let mut contents = String::new();
-    let _ = file.seek(SeekFrom::Start(0));
-    let _ = file.read_to_string(&mut contents);
+    // Read the canonical file. Missing file is fine — first write.
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
 
     let cutoff = time::OffsetDateTime::now_utc()
         - time::Duration::days(RETENTION_DAYS.load(std::sync::atomic::Ordering::Acquire));
-    let kept: Vec<&str> = contents
-        .lines()
-        .filter(|line| {
-            serde_json::from_str::<Event>(line)
-                .ok()
-                .and_then(|e| time::OffsetDateTime::parse(&e.ts, &Iso8601::DEFAULT).ok())
-                .map(|t| t >= cutoff)
-                .unwrap_or(false)
-        })
-        .collect();
+    let mut new_contents = String::with_capacity(contents.len() + 256);
+    for line in contents.lines() {
+        let keep = serde_json::from_str::<Event>(line)
+            .ok()
+            .and_then(|e| time::OffsetDateTime::parse(&e.ts, &Iso8601::DEFAULT).ok())
+            .map(|t| t >= cutoff)
+            .unwrap_or(false);
+        if keep {
+            new_contents.push_str(line);
+            new_contents.push('\n');
+        }
+    }
     let new_line = serde_json::to_string(event).unwrap_or_default();
-
-    let _ = file.set_len(0);
-    let _ = file.seek(SeekFrom::Start(0));
-    for line in &kept {
-        let _ = writeln!(file, "{line}");
-    }
     if !new_line.is_empty() {
-        let _ = writeln!(file, "{new_line}");
+        new_contents.push_str(&new_line);
+        new_contents.push('\n');
     }
-    let _ = file.flush();
-    let _ = fs4::FileExt::unlock(&file);
+
+    // Sibling temp file so the rename is guaranteed to land on the same
+    // filesystem (POSIX rename(2) and Win32 MoveFileEx atomic rename both
+    // require this). Tagging with the current pid avoids confusing temps left
+    // behind by a previously crashed writer; concurrent writers within the
+    // same process are already serialised by the exclusive lock above.
+    let pid = std::process::id();
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("events.jsonl"));
+    tmp_name.push(format!(".tmp.{pid}"));
+    let tmp_path = match path.parent() {
+        Some(parent) => parent.join(&tmp_name),
+        None => std::path::PathBuf::from(&tmp_name),
+    };
+
+    let Ok(mut tmp) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+    else {
+        let _ = fs4::FileExt::unlock(&lock_file);
+        return;
+    };
+    if tmp.write_all(new_contents.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = fs4::FileExt::unlock(&lock_file);
+        return;
+    }
+    if tmp.flush().is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = fs4::FileExt::unlock(&lock_file);
+        return;
+    }
+    if tmp.sync_data().is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = fs4::FileExt::unlock(&lock_file);
+        return;
+    }
+    // Drop the temp handle before renaming. On Windows, leaving an open handle
+    // on the source can interfere with rename; closing it first is portable.
+    drop(tmp);
+    if std::fs::rename(&tmp_path, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = fs4::FileExt::unlock(&lock_file);
+        return;
+    }
+
+    let _ = fs4::FileExt::unlock(&lock_file);
 }
 
 #[cfg(test)]
