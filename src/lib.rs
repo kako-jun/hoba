@@ -34,12 +34,21 @@ pub mod audio;
 use getrandom::getrandom;
 #[cfg(feature = "whiten")]
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "log")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static COMPROMISED_DEPTH: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(feature = "whiten")]
 static WHITEN_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Process-global tally of events the on-disk log silently dropped because
+/// some step in `append_event_with_retention` failed (open / lock / temp
+/// open / write / flush / fsync / rename). Bumped only inside that function;
+/// surfaced via [`dropped_event_count`].
+#[cfg(feature = "log")]
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Enables or disables the whitening pipeline at runtime. Only available
 /// when the `whiten` feature is compiled in.
@@ -317,6 +326,26 @@ pub fn retention_days() -> u32 {
     RETENTION_DAYS.load(std::sync::atomic::Ordering::Acquire) as u32
 }
 
+/// Returns the number of events the background detector has tried — and
+/// failed — to write to the on-disk log over the lifetime of this process.
+///
+/// The counter is incremented whenever
+/// `append_event_with_retention` bails out before the temp file is
+/// successfully renamed over `events.jsonl`: missing log directory, lock
+/// contention, full disk, fsync error, rename error, etc.
+///
+/// Useful for diagnosing why a host running with `HOBA_MONITOR=1` is
+/// producing a sparser-than-expected log: a non-zero count means the writes
+/// reached the function and were rejected by the filesystem path, not that
+/// the detector itself failed to fire.
+///
+/// The counter is process-global and never resets while the process is
+/// alive; callers that want a delta should snapshot before and after.
+#[cfg(feature = "log")]
+pub fn dropped_event_count() -> u64 {
+    DROPPED_EVENTS.load(Ordering::Acquire)
+}
+
 // Only used inside the detector thread (gated on `mic` & `not(test)`).
 // Compiling under `--all-features` plus tests would otherwise warn dead-code.
 #[cfg(all(feature = "log", feature = "mic", not(test)))]
@@ -409,6 +438,7 @@ fn append_event_with_retention(event: &Event) {
     use time::format_description::well_known::Iso8601;
 
     let Some(path) = log_path() else {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         return;
     };
 
@@ -436,6 +466,7 @@ fn append_event_with_retention(event: &Event) {
         .truncate(false)
         .open(&lock_path)
     else {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         return;
     };
     // `lock_file` is owned for the duration of the critical section below; the
@@ -445,6 +476,7 @@ fn append_event_with_retention(event: &Event) {
     // the trait so we keep working with the toolchain's MSRV (1.78) where
     // `File::lock` is not yet inherent.
     if fs4::FileExt::lock(&lock_file).is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         return;
     }
 
@@ -493,20 +525,24 @@ fn append_event_with_retention(event: &Event) {
         .truncate(true)
         .open(&tmp_path)
     else {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = fs4::FileExt::unlock(&lock_file);
         return;
     };
     if tmp.write_all(new_contents.as_bytes()).is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
         let _ = fs4::FileExt::unlock(&lock_file);
         return;
     }
     if tmp.flush().is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
         let _ = fs4::FileExt::unlock(&lock_file);
         return;
     }
     if tmp.sync_data().is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
         let _ = fs4::FileExt::unlock(&lock_file);
         return;
@@ -515,6 +551,7 @@ fn append_event_with_retention(event: &Event) {
     // on the source can interfere with rename; closing it first is portable.
     drop(tmp);
     if std::fs::rename(&tmp_path, &path).is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         let _ = std::fs::remove_file(&tmp_path);
         let _ = fs4::FileExt::unlock(&lock_file);
         return;
@@ -940,5 +977,68 @@ mod log_tests {
 
         std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropped_count_zero_on_normal_append() {
+        // The counter is process-global and shared across all tests in the
+        // same binary; snapshot before, append a known number of events, and
+        // assert the delta is 0. Comparing against raw 0 would fail under
+        // any other test in this module that intentionally exercises a
+        // failure path.
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("dropped-zero");
+        let path = dir.join("events.jsonl");
+        std::fs::remove_file(&path).ok();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        let before = dropped_event_count();
+        for i in 0..5 {
+            append_event_with_retention(&Event {
+                ts: now_iso(),
+                peak_hz: 19_000.0 + i as f32,
+                peak_db: -25.0,
+                duration_ms: 100,
+                depth: 1,
+            });
+        }
+        let after = dropped_event_count();
+        assert_eq!(
+            after - before,
+            0,
+            "normal appends should not bump the dropped counter (before={before}, after={after})"
+        );
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropped_count_increments_on_unwritable_path() {
+        // /dev/null is not a directory, so create_dir_all on a path beneath
+        // it always fails. log_path() returns None in that case and
+        // append_event_with_retention takes its first dropped-counter branch.
+        // This is a deterministic failure across Linux and macOS CI.
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let unwritable = std::path::PathBuf::from("/dev/null/hoba-not-a-dir/events.jsonl");
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &unwritable);
+
+        let before = dropped_event_count();
+        append_event_with_retention(&Event {
+            ts: now_iso(),
+            peak_hz: 19_000.0,
+            peak_db: -25.0,
+            duration_ms: 100,
+            depth: 1,
+        });
+        let after = dropped_event_count();
+        assert_eq!(
+            after - before,
+            1,
+            "an unwritable log path should bump the dropped counter exactly once \
+             (before={before}, after={after})"
+        );
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
     }
 }
