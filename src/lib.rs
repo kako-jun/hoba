@@ -27,19 +27,43 @@
 //! appends one JSON line to a per-host event log on every quiet → trigger
 //! → quiet cycle. Read recent events back via [`recent_events`].
 //!
+//! For diagnosing a quiet host, three read-only counters complement
+//! [`is_compromised`] / [`compromised_depth`]:
+//! [`audio_active`] reports whether the background detector is reading
+//! live audio (mic feature), and [`dropped_event_count`] tallies events
+//! the on-disk log silently rejected (log feature). Together they
+//! distinguish "no triggers happened" from "the monitor never started"
+//! from "every write was thrown away".
+//!
 //! Named after Hoba Eiichi (帆場暎一).
 
 pub mod audio;
 
 use getrandom::getrandom;
-#[cfg(feature = "whiten")]
+#[cfg(any(feature = "whiten", feature = "mic"))]
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "log")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static COMPROMISED_DEPTH: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(feature = "whiten")]
 static WHITEN_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set to `true` by the detector thread once it has successfully opened the
+/// default audio input and is reading samples; cleared back to `false` when
+/// the thread exits (mic disappears, panic, etc.). Surfaced via
+/// [`audio_active`].
+#[cfg(feature = "mic")]
+static MIC_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Process-global tally of events the on-disk log silently dropped because
+/// some step in `append_event_with_retention` failed (open / lock / temp
+/// open / write / flush / fsync / rename). Bumped only inside that function;
+/// surfaced via [`dropped_event_count`].
+#[cfg(feature = "log")]
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// Enables or disables the whitening pipeline at runtime. Only available
 /// when the `whiten` feature is compiled in.
@@ -70,10 +94,13 @@ fn ensure_detector_running() {
     INIT.call_once(|| {
         // If the detector loop ever exits (panic, mic disappears), clear the depth so
         // the library degrades to plain RNG instead of latching the last compromised state.
+        // Same goes for MIC_ACTIVE: any callers polling audio_active() should observe the
+        // monitor going inactive once the thread is gone.
         struct ClearOnDrop;
         impl Drop for ClearOnDrop {
             fn drop(&mut self) {
                 COMPROMISED_DEPTH.store(0, Ordering::Release);
+                MIC_ACTIVE.store(false, Ordering::Release);
             }
         }
         let _ = std::thread::Builder::new()
@@ -84,6 +111,9 @@ fn ensure_detector_running() {
                 if !mic.is_active() {
                     return;
                 }
+                // Mic opened successfully; signal to audio_active() callers that the
+                // monitor is now reading live audio.
+                MIC_ACTIVE.store(true, Ordering::Release);
                 let mut detector = audio::Detector::with_source(mic);
                 #[cfg(feature = "log")]
                 let mut active: Option<EventInProgress> = None;
@@ -263,6 +293,35 @@ pub fn compromised_depth() -> u8 {
     COMPROMISED_DEPTH.load(Ordering::Acquire)
 }
 
+/// Returns `true` if the background mic monitor is actively reading audio
+/// from a live input device.
+///
+/// Returns `false` when the `mic` feature is off, when `HOBA_MONITOR=1` is
+/// unset, when the device failed to open (no device, permission denied,
+/// no compatible sample format), or when the monitor thread has not yet
+/// had a chance to initialise.
+///
+/// **Startup race:** the first call after the gating env var is set merely
+/// schedules the detector thread; it has not yet run `MicSource::new()`,
+/// so this function may briefly return `false`. Callers wanting a
+/// definitive answer should poll for ~100 ms after the first call;
+/// subsequent calls converge to the actual state.
+///
+/// Lazily starts the background mic monitor on first use, like
+/// [`is_compromised`] / [`compromised_depth`].
+#[cfg(feature = "mic")]
+pub fn audio_active() -> bool {
+    ensure_detector_running();
+    MIC_ACTIVE.load(Ordering::Acquire)
+}
+
+/// Stub returned when the `mic` feature is disabled — the mic monitor cannot
+/// run, so the answer is always `false`.
+#[cfg(not(feature = "mic"))]
+pub fn audio_active() -> bool {
+    false
+}
+
 fn current_mask() -> u64 {
     let depth = COMPROMISED_DEPTH.load(Ordering::Acquire);
     u64::MAX.wrapping_shl(u32::from(depth.min(63)))
@@ -315,6 +374,26 @@ pub fn set_retention_days(days: u32) {
 #[cfg(feature = "log")]
 pub fn retention_days() -> u32 {
     RETENTION_DAYS.load(std::sync::atomic::Ordering::Acquire) as u32
+}
+
+/// Returns the number of events the background detector has tried — and
+/// failed — to write to the on-disk log over the lifetime of this process.
+///
+/// The counter is incremented whenever
+/// `append_event_with_retention` bails out before the temp file is
+/// successfully renamed over `events.jsonl`: missing log directory, lock
+/// contention, full disk, fsync error, rename error, etc.
+///
+/// Useful for diagnosing why a host running with `HOBA_MONITOR=1` is
+/// producing a sparser-than-expected log: a non-zero count means the writes
+/// reached the function and were rejected by the filesystem path, not that
+/// the detector itself failed to fire.
+///
+/// The counter is process-global and never resets while the process is
+/// alive; callers that want a delta should snapshot before and after.
+#[cfg(feature = "log")]
+pub fn dropped_event_count() -> u64 {
+    DROPPED_EVENTS.load(Ordering::Acquire)
 }
 
 // Only used inside the detector thread (gated on `mic` & `not(test)`).
@@ -405,54 +484,134 @@ fn read_all_events() -> Vec<Event> {
 
 #[cfg(feature = "log")]
 fn append_event_with_retention(event: &Event) {
-    use fs2::FileExt;
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::Write;
     use time::format_description::well_known::Iso8601;
 
     let Some(path) = log_path() else {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         return;
     };
-    let Ok(mut file) = std::fs::OpenOptions::new()
+
+    // We coordinate writers through a sibling lock file with a stable path.
+    // The canonical `events.jsonl` is replaced by atomic rename below, so its
+    // inode keeps changing — flock(2) is per-open-file-description, so locking
+    // a path that gets renamed out from under us would not actually serialise
+    // a second writer that opens the new inode after the rename. A dedicated
+    // sibling that is *only* opened-and-locked, never renamed, fixes that.
+    let mut lock_path = path.clone();
+    let lock_name = match path.file_name() {
+        Some(n) => {
+            let mut s = n.to_os_string();
+            s.push(".lock");
+            s
+        }
+        None => std::ffi::OsString::from("events.jsonl.lock"),
+    };
+    lock_path.set_file_name(&lock_name);
+
+    let Ok(lock_file) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)
+        .open(&lock_path)
     else {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         return;
     };
-    if file.lock_exclusive().is_err() {
+    // `lock_file` is owned for the duration of the critical section below; the
+    // lock is released when the handle is dropped. Routed explicitly through
+    // the trait so it keeps working under future MSRV bumps where the inherent
+    // `std::fs::File::lock` shadows the trait method.
+    if fs4::FileExt::lock(&lock_file).is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
         return;
     }
 
-    let mut contents = String::new();
-    let _ = file.seek(SeekFrom::Start(0));
-    let _ = file.read_to_string(&mut contents);
+    // Read the canonical file. Missing file is fine (first write); any other
+    // I/O failure (transient EIO, permission flap) must abort — silently
+    // discarding the read and rewriting the tmp would clobber the existing
+    // history with just the new event, breaking the crash-safety contract.
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => {
+            DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
+            return;
+        }
+    };
 
     let cutoff = time::OffsetDateTime::now_utc()
         - time::Duration::days(RETENTION_DAYS.load(std::sync::atomic::Ordering::Acquire));
-    let kept: Vec<&str> = contents
-        .lines()
-        .filter(|line| {
-            serde_json::from_str::<Event>(line)
-                .ok()
-                .and_then(|e| time::OffsetDateTime::parse(&e.ts, &Iso8601::DEFAULT).ok())
-                .map(|t| t >= cutoff)
-                .unwrap_or(false)
-        })
-        .collect();
+    let mut new_contents = String::with_capacity(contents.len() + 256);
+    for line in contents.lines() {
+        let keep = serde_json::from_str::<Event>(line)
+            .ok()
+            .and_then(|e| time::OffsetDateTime::parse(&e.ts, &Iso8601::DEFAULT).ok())
+            .map(|t| t >= cutoff)
+            .unwrap_or(false);
+        if keep {
+            new_contents.push_str(line);
+            new_contents.push('\n');
+        }
+    }
     let new_line = serde_json::to_string(event).unwrap_or_default();
-
-    let _ = file.set_len(0);
-    let _ = file.seek(SeekFrom::Start(0));
-    for line in &kept {
-        let _ = writeln!(file, "{line}");
-    }
     if !new_line.is_empty() {
-        let _ = writeln!(file, "{new_line}");
+        new_contents.push_str(&new_line);
+        new_contents.push('\n');
     }
-    let _ = file.flush();
-    let _ = fs2::FileExt::unlock(&file);
+
+    // Sibling temp file so the rename is guaranteed to land on the same
+    // filesystem (POSIX rename(2) and Win32 MoveFileEx atomic rename both
+    // require this). Tagging with the current pid avoids confusing temps left
+    // behind by a previously crashed writer; concurrent writers within the
+    // same process are already serialised by the exclusive lock above.
+    let pid = std::process::id();
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("events.jsonl"));
+    tmp_name.push(format!(".tmp.{pid}"));
+    let tmp_path = match path.parent() {
+        Some(parent) => parent.join(&tmp_name),
+        None => std::path::PathBuf::from(&tmp_name),
+    };
+
+    // The `lock_file` handle is held to the end of the function; its Drop
+    // releases the flock automatically. Adding explicit unlock calls in each
+    // error tail is redundant and clutters the failure paths.
+    let Ok(mut tmp) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+    else {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
+        return;
+    };
+    if tmp.write_all(new_contents.as_bytes()).is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    if tmp.flush().is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    if tmp.sync_data().is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+    // Drop the temp handle before renaming. On Windows, leaving an open handle
+    // on the source can interfere with rename; closing it first is portable.
+    drop(tmp);
+    if std::fs::rename(&tmp_path, &path).is_err() {
+        DROPPED_EVENTS.fetch_add(1, Ordering::AcqRel);
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    drop(lock_file);
 }
 
 #[cfg(test)]
@@ -869,6 +1028,110 @@ mod log_tests {
             count += 1;
         }
         assert_eq!(count, n_threads * per_thread);
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropped_count_zero_on_normal_append() {
+        // The counter is process-global and shared across all tests in the
+        // same binary; snapshot before, append a known number of events, and
+        // assert the delta is 0. Comparing against raw 0 would fail under
+        // any other test in this module that intentionally exercises a
+        // failure path.
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = unique_tmp_dir("dropped-zero");
+        let path = dir.join("events.jsonl");
+        std::fs::remove_file(&path).ok();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        let before = dropped_event_count();
+        for i in 0..5 {
+            append_event_with_retention(&Event {
+                ts: now_iso(),
+                peak_hz: 19_000.0 + i as f32,
+                peak_db: -25.0,
+                duration_ms: 100,
+                depth: 1,
+            });
+        }
+        let after = dropped_event_count();
+        assert_eq!(
+            after - before,
+            0,
+            "normal appends should not bump the dropped counter (before={before}, after={after})"
+        );
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropped_count_increments_on_unwritable_path() {
+        // /dev/null is not a directory, so create_dir_all on a path beneath
+        // it always fails. log_path() returns None in that case and
+        // append_event_with_retention takes its first dropped-counter branch.
+        // This is a deterministic failure across Linux and macOS CI.
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let unwritable = std::path::PathBuf::from("/dev/null/hoba-not-a-dir/events.jsonl");
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &unwritable);
+
+        let before = dropped_event_count();
+        append_event_with_retention(&Event {
+            ts: now_iso(),
+            peak_hz: 19_000.0,
+            peak_db: -25.0,
+            duration_ms: 100,
+            depth: 1,
+        });
+        let after = dropped_event_count();
+        assert_eq!(
+            after - before,
+            1,
+            "an unwritable log path should bump the dropped counter exactly once \
+             (before={before}, after={after})"
+        );
+
+        std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
+    }
+
+    #[test]
+    fn dropped_count_increments_on_read_failure_keeps_history() {
+        // If `events.jsonl` exists but is unreadable (here: replaced by a
+        // directory of the same name so read_to_string returns EISDIR), we
+        // must abort and bump the counter — NOT silently treat the read
+        // failure as "missing file" and rewrite the log with only the new
+        // event. The latter would clobber any existing history.
+        let _guard = LOG_TEST_MUTEX.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hoba-test-readfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        // Make `path` itself a directory so `read_to_string(&path)` returns
+        // an error other than NotFound.
+        std::fs::create_dir_all(&path).unwrap();
+        std::env::set_var("HOBA_LOG_PATH_OVERRIDE", &path);
+
+        let before = dropped_event_count();
+        append_event_with_retention(&Event {
+            ts: now_iso(),
+            peak_hz: 19_000.0,
+            peak_db: -25.0,
+            duration_ms: 100,
+            depth: 1,
+        });
+        let after = dropped_event_count();
+        assert_eq!(
+            after - before,
+            1,
+            "read failure on existing log path must bump the dropped counter \
+             exactly once (before={before}, after={after})"
+        );
+        assert!(
+            path.is_dir(),
+            "events.jsonl path must remain a directory — abort before rename \
+             is the contract that preserves history on transient I/O failures"
+        );
 
         std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
         std::fs::remove_dir_all(&dir).ok();
