@@ -71,41 +71,246 @@ impl AudioSource for SineSource {
 /// 2048-point FFT: bin width 23.4 Hz at 48 kHz, ~810 cycles of a 19 kHz tone per window.
 const FFT_SIZE: usize = 2048;
 /// Per-bucket center frequency (Hz) and corresponding mask depth (1–4 low bits cleared).
-/// The dominant bucket within the trigger band dictates `Detector::depth`.
+/// Kept `pub(crate)` as a test fixture pinning the historical default band; live
+/// detection logic now reads from [`DetectorConfig`], so production code should
+/// reach the same values via [`DetectorConfig::release_default`] /
+/// [`DetectorConfig::audible_test`].
 #[cfg(not(feature = "audible-test"))]
+#[allow(dead_code)]
 pub(crate) const BUCKETS: [(f32, u8); 4] =
     [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
 /// Audible-band stand-in for development. Most laptop and consumer speakers
 /// reproduce 1–2.5 kHz cleanly, so the detector can be exercised through a
 /// tone generator without specialized hardware.
 #[cfg(feature = "audible-test")]
+#[allow(dead_code)]
 pub(crate) const BUCKETS: [(f32, u8); 4] = [(1_000.0, 1), (1_500.0, 2), (2_000.0, 3), (2_500.0, 4)];
 /// Half-width of each bucket window in Hz; band power is summed over `center ± this`.
 const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
-/// Bounds (inclusive) of the band scanned for `peak_hz` / `peak_db`. Slightly
-/// wider than the bucket spread to absorb spectral leakage at the edges.
-#[cfg(not(feature = "audible-test"))]
-const PEAK_BAND_HZ: (f32, f32) = (18_900.0, 20_600.0);
-#[cfg(feature = "audible-test")]
-const PEAK_BAND_HZ: (f32, f32) = (900.0, 2_600.0);
 
 /// dBFS value reported by [`Detector::peak_db`] when no signal is present
 /// (peak magnitude is zero). Callers comparing against silence should use
 /// this constant rather than the literal.
 pub const SILENCE_DB: f32 = -100.0;
-/// Shared threshold across all four buckets. Calibrated so that pure tones at any
-/// bucket center @ amp 0.5 produce band power ~262_144 (verified by the per-bucket
-/// tests); threshold sits ~26x below so amplitude swings have headroom.
-#[cfg(not(feature = "audible-test"))]
-const POWER_THRESHOLD: f32 = 10_000.0;
-/// In audible-test mode the trigger is meant to be exercised through the
-/// speaker → air → mic path, which typically attenuates signals by 20–30 dB
-/// vs. direct injection. The threshold is reduced accordingly so a tone at
-/// modest playback amplitude reliably trips the detector.
-#[cfg(feature = "audible-test")]
-const POWER_THRESHOLD: f32 = 100.0;
 /// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
+/// Internal sample rate the default configs are calibrated against. Detector logic
+/// recomputes bin sizes from the live source's reported sample rate, so this is
+/// only a documentation hint for env-var / CLI overrides.
+const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+
+/// Runtime-tunable detector knobs.
+///
+/// The default behaviour of [`Detector::new`] / [`Detector::with_source`] is
+/// equivalent to `DetectorConfig::release_default()` (or
+/// `DetectorConfig::audible_test()` when the `audible-test` cargo feature is
+/// on). Pass a custom config to [`Detector::with_config`] when you want to
+/// monitor a different band (sub-bass, ultrasonic at a non-standard center,
+/// CI-friendly tones, …) without a recompile.
+///
+/// Construction conventions:
+/// - `buckets`: 1–N entries of `(center_hz, depth)`. `depth` is the LSB-clear
+///   count reported when that bucket dominates. Empty `buckets` makes the
+///   detector unable to trigger; the constructor accepts it but the resulting
+///   detector permanently reports `depth() == 0`.
+/// - `power_threshold`: minimum raw band power (post-FFT) for the dominant
+///   bucket to count. Same units as the legacy const.
+/// - `peak_band_hz`: `(lo, hi)` window scanned for `peak_hz` / `peak_db`. Use
+///   [`DetectorConfig::peak_band_from_buckets`] to derive a sensible default
+///   covering all bucket centers plus margin.
+/// - `sample_rate`: documentation hint only; the live source's reported rate
+///   is what the FFT uses.
+#[derive(Debug, Clone)]
+pub struct DetectorConfig {
+    /// `(center_hz, depth)` pairs that define the trigger buckets.
+    pub buckets: Vec<(f32, u8)>,
+    /// Minimum raw band power required for the dominant bucket to flip the trigger.
+    pub power_threshold: f32,
+    /// `(lo, hi)` Hz bounds for the peak-search band reported via `peak_hz` / `peak_db`.
+    pub peak_band_hz: (f32, f32),
+    /// Documentation hint — the live source dictates actual FFT bin width.
+    pub sample_rate: u32,
+}
+
+impl DetectorConfig {
+    /// Production default: 19–21 kHz ultrasonic band with the legacy 10_000 power threshold.
+    pub fn release_default() -> Self {
+        Self {
+            buckets: vec![(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)],
+            power_threshold: 10_000.0,
+            peak_band_hz: (18_900.0, 20_600.0),
+            sample_rate: DEFAULT_SAMPLE_RATE,
+        }
+    }
+
+    /// Audible-band preset for development, CI, and live demos. Reachable
+    /// without the `audible-test` cargo feature: pass this config to
+    /// [`Detector::with_config`] from a release build.
+    pub fn audible_test() -> Self {
+        Self {
+            buckets: vec![(1_000.0, 1), (1_500.0, 2), (2_000.0, 3), (2_500.0, 4)],
+            power_threshold: 100.0,
+            peak_band_hz: (900.0, 2_600.0),
+            sample_rate: DEFAULT_SAMPLE_RATE,
+        }
+    }
+
+    /// Reads `HOBA_BUCKETS` / `HOBA_THRESHOLD` / `HOBA_PEAK_BAND` from the
+    /// process environment and merges them with [`Self::release_default`] (or
+    /// [`Self::audible_test`] when the `audible-test` feature is on).
+    ///
+    /// Returns `None` if no relevant env vars are set, so callers can skip
+    /// the override path entirely. Returns `Some(config)` if at least one
+    /// override is present; unrecognised values fall back to the matching
+    /// default field. When `HOBA_DEBUG=1` is set, parse failures emit a
+    /// single line on stderr; otherwise failures are silent (consistent with
+    /// hoba's library-fails-quietly contract).
+    pub fn from_env() -> Option<Self> {
+        let buckets_raw = std::env::var("HOBA_BUCKETS").ok();
+        let threshold_raw = std::env::var("HOBA_THRESHOLD").ok();
+        let peak_band_raw = std::env::var("HOBA_PEAK_BAND").ok();
+        if buckets_raw.is_none() && threshold_raw.is_none() && peak_band_raw.is_none() {
+            return None;
+        }
+
+        let mut config = base_default();
+        let debug = std::env::var("HOBA_DEBUG").as_deref() == Ok("1");
+
+        if let Some(s) = buckets_raw.as_deref() {
+            match parse_buckets_env(s) {
+                Ok(buckets) if !buckets.is_empty() => {
+                    config.buckets = buckets;
+                    // If the user did not also supply a peak band, recompute it
+                    // from the new buckets so peak_hz reporting stays meaningful.
+                    if peak_band_raw.is_none() {
+                        config.peak_band_hz = Self::peak_band_from_buckets(&config.buckets);
+                    }
+                }
+                Ok(_) => {
+                    if debug {
+                        eprintln!(
+                            "hoba: HOBA_BUCKETS parsed but yielded zero entries; using default"
+                        );
+                    }
+                }
+                Err(e) => {
+                    if debug {
+                        eprintln!("hoba: HOBA_BUCKETS invalid ({e}); using default");
+                    }
+                }
+            }
+        }
+
+        if let Some(s) = threshold_raw.as_deref() {
+            match s.trim().parse::<f32>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => config.power_threshold = v,
+                Ok(_) | Err(_) => {
+                    if debug {
+                        eprintln!("hoba: HOBA_THRESHOLD invalid ({s:?}); using default");
+                    }
+                }
+            }
+        }
+
+        if let Some(s) = peak_band_raw.as_deref() {
+            match parse_peak_band_env(s) {
+                Ok(band) => config.peak_band_hz = band,
+                Err(e) => {
+                    if debug {
+                        eprintln!("hoba: HOBA_PEAK_BAND invalid ({e}); using default");
+                    }
+                }
+            }
+        }
+
+        Some(config)
+    }
+
+    /// Derives a `(lo, hi)` peak-search band from a bucket list: spans the
+    /// min/max bucket center with a small margin (1.5× the per-bucket
+    /// half-width on each side) to absorb FFT leakage at the edges. Returns
+    /// `(0.0, 0.0)` for an empty bucket list.
+    pub fn peak_band_from_buckets(buckets: &[(f32, u8)]) -> (f32, f32) {
+        if buckets.is_empty() {
+            return (0.0, 0.0);
+        }
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &(c, _) in buckets {
+            if c < lo {
+                lo = c;
+            }
+            if c > hi {
+                hi = c;
+            }
+        }
+        let margin = BUCKET_HALF_WIDTH_HZ * 1.5;
+        ((lo - margin).max(0.0), hi + margin)
+    }
+}
+
+impl Default for DetectorConfig {
+    fn default() -> Self {
+        base_default()
+    }
+}
+
+#[cfg(not(feature = "audible-test"))]
+fn base_default() -> DetectorConfig {
+    DetectorConfig::release_default()
+}
+
+#[cfg(feature = "audible-test")]
+fn base_default() -> DetectorConfig {
+    DetectorConfig::audible_test()
+}
+
+fn parse_buckets_env(s: &str) -> Result<Vec<(f32, u8)>, String> {
+    let mut out = Vec::new();
+    for raw in s.split(',') {
+        let part = raw.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (hz_s, depth_s) = part
+            .split_once(':')
+            .ok_or_else(|| format!("'{part}' is missing ':<depth>'"))?;
+        let hz: f32 = hz_s
+            .trim()
+            .parse()
+            .map_err(|e| format!("center_hz '{hz_s}' invalid: {e}"))?;
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(format!("center_hz must be positive and finite: {hz_s}"));
+        }
+        let depth: u8 = depth_s
+            .trim()
+            .parse()
+            .map_err(|e| format!("depth '{depth_s}' invalid: {e}"))?;
+        if !(1..=4).contains(&depth) {
+            return Err(format!("depth must be 1..=4: {depth_s}"));
+        }
+        out.push((hz, depth));
+    }
+    Ok(out)
+}
+
+fn parse_peak_band_env(s: &str) -> Result<(f32, f32), String> {
+    let (lo_s, hi_s) = s
+        .split_once(':')
+        .ok_or_else(|| format!("expected 'lo:hi', got '{s}'"))?;
+    let lo: f32 = lo_s
+        .trim()
+        .parse()
+        .map_err(|e| format!("lo '{lo_s}' invalid: {e}"))?;
+    let hi: f32 = hi_s
+        .trim()
+        .parse()
+        .map_err(|e| format!("hi '{hi_s}' invalid: {e}"))?;
+    if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi <= lo {
+        return Err(format!("require 0 <= lo < hi, got ({lo}, {hi})"));
+    }
+    Ok((lo, hi))
+}
 
 /// Pulls samples from an [`AudioSource`] and detects ultrasonic trigger tones.
 ///
@@ -129,6 +334,7 @@ pub struct Detector<S: AudioSource> {
     depth: u8,
     last_peak_hz: f32,
     last_peak_db: f32,
+    config: DetectorConfig,
 }
 
 impl<S: AudioSource + core::fmt::Debug> core::fmt::Debug for Detector<S> {
@@ -143,8 +349,18 @@ impl<S: AudioSource + core::fmt::Debug> core::fmt::Debug for Detector<S> {
 }
 
 impl<S: AudioSource> Detector<S> {
-    /// Constructs a detector that reads from `source`.
+    /// Constructs a detector that reads from `source`, using the compile-time
+    /// default configuration ([`DetectorConfig::release_default`], or
+    /// [`DetectorConfig::audible_test`] when the `audible-test` feature is on).
     pub fn with_source(source: S) -> Self {
+        Self::with_config(source, base_default())
+    }
+
+    /// Constructs a detector that reads from `source` using the supplied
+    /// runtime configuration. Prefer this when you need a band other than
+    /// the compile-time default — sub-bass HVAC monitoring, a non-standard
+    /// ultrasonic center, an audible test tone in a release build, etc.
+    pub fn with_config(source: S, config: DetectorConfig) -> Self {
         let mut planner = rustfft::FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         Self {
@@ -157,7 +373,13 @@ impl<S: AudioSource> Detector<S> {
             depth: 0,
             last_peak_hz: 0.0,
             last_peak_db: SILENCE_DB,
+            config,
         }
+    }
+
+    /// Returns a reference to the active detector configuration.
+    pub fn config(&self) -> &DetectorConfig {
+        &self.config
     }
 
     /// Returns the underlying source's sample rate in Hz.
@@ -181,9 +403,10 @@ impl<S: AudioSource> Detector<S> {
         }
         self.fft.process(&mut self.scratch);
 
-        // Cache peak metrics across the trigger band (covers all four 0.5 kHz buckets
-        // plus a small margin for spectral leakage).
-        let (peak_bin, peak_norm_sqr) = self.peak_in_band(PEAK_BAND_HZ.0, PEAK_BAND_HZ.1);
+        // Cache peak metrics across the trigger band (covers all configured
+        // buckets plus a small margin for spectral leakage).
+        let (peak_lo, peak_hi) = self.config.peak_band_hz;
+        let (peak_bin, peak_norm_sqr) = self.peak_in_band(peak_lo, peak_hi);
         let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
         self.last_peak_hz = (peak_bin as f64 * bin_hz) as f32;
         let peak_magnitude = peak_norm_sqr.sqrt();
@@ -258,14 +481,20 @@ impl<S: AudioSource> Detector<S> {
         // Strict `>` keeps the first-listed (lower-depth) bucket on exact ties — clears
         // fewer bits when the signal is ambiguous, which is the conservative default.
         let mut best: Option<(f32, u8)> = None;
-        for &(center, depth) in &BUCKETS {
+        for &(center, depth) in &self.config.buckets {
             let p = self
                 .band_power_between(center - BUCKET_HALF_WIDTH_HZ, center + BUCKET_HALF_WIDTH_HZ);
             if best.map_or(true, |(bp, _)| p > bp) {
                 best = Some((p, depth));
             }
         }
-        best.and_then(|(p, d)| if p >= POWER_THRESHOLD { Some(d) } else { None })
+        best.and_then(|(p, d)| {
+            if p >= self.config.power_threshold {
+                Some(d)
+            } else {
+                None
+            }
+        })
     }
 
     fn band_power_between(&self, lo_hz: f32, hi_hz: f32) -> f32 {
@@ -473,6 +702,177 @@ mod tests {
             diff <= tolerance,
             "expected ~{expected} zero crossings, got {crossings}"
         );
+    }
+
+    /// Helper that constructs a `DetectorConfig` for a single-bucket band at
+    /// `center_hz`, sized to match the historical 100 Hz half-width and a
+    /// generous peak band so tone-injection tests stay deterministic.
+    fn config_for_band(center_hz: f32, depth: u8, threshold: f32) -> DetectorConfig {
+        DetectorConfig {
+            buckets: vec![(center_hz, depth)],
+            power_threshold: threshold,
+            peak_band_hz: ((center_hz - 200.0).max(0.0), center_hz + 200.0),
+            sample_rate: 48_000,
+        }
+    }
+
+    #[test]
+    fn detector_with_config_triggers_on_custom_band() {
+        // Pick a sub-bass band the const-based default would never see.
+        let cfg = config_for_band(200.0, 3, 100.0);
+        let mut detector = Detector::with_config(SineSource::new(200.0, 0.5), cfg);
+        for _ in 0..12 {
+            detector.poll();
+        }
+        assert_eq!(detector.depth(), 3);
+        assert!(detector.is_compromised());
+    }
+
+    #[test]
+    fn detector_with_config_ignores_out_of_band_tone() {
+        // 5 kHz tone, but the detector is configured to watch 200 Hz only.
+        let cfg = config_for_band(200.0, 1, 100.0);
+        let mut detector = Detector::with_config(SineSource::new(5_000.0, 0.5), cfg);
+        for _ in 0..24 {
+            detector.poll();
+        }
+        assert_eq!(detector.depth(), 0);
+    }
+
+    #[test]
+    fn detector_config_release_default_round_trip() {
+        let cfg = DetectorConfig::release_default();
+        assert_eq!(cfg.buckets.len(), 4);
+        assert!((cfg.buckets[0].0 - 19_000.0).abs() < 1.0);
+        assert!((cfg.power_threshold - 10_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn detector_config_audible_test_round_trip() {
+        let cfg = DetectorConfig::audible_test();
+        assert_eq!(cfg.buckets.len(), 4);
+        assert!((cfg.buckets[0].0 - 1_000.0).abs() < 1.0);
+        assert!((cfg.power_threshold - 100.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn detector_config_peak_band_from_buckets_spans_min_max() {
+        let buckets = vec![(20.0, 1), (50.0, 4)];
+        let (lo, hi) = DetectorConfig::peak_band_from_buckets(&buckets);
+        assert!(lo < 20.0);
+        assert!(hi > 50.0);
+        assert!(lo >= 0.0);
+    }
+
+    #[test]
+    fn detector_config_from_env_returns_none_when_no_vars_set() {
+        let _g = EnvGuard::clear_all();
+        assert!(DetectorConfig::from_env().is_none());
+    }
+
+    #[test]
+    fn detector_config_from_env_parses_buckets_only() {
+        let _g = EnvGuard::clear_all();
+        std::env::set_var("HOBA_BUCKETS", "100:1,200:2,300:3");
+        let cfg = DetectorConfig::from_env().expect("bucket override should yield Some");
+        assert_eq!(cfg.buckets, vec![(100.0, 1), (200.0, 2), (300.0, 3)]);
+        // peak_band auto-derived from the new buckets, not left at the default.
+        assert!(cfg.peak_band_hz.0 < 100.0);
+        assert!(cfg.peak_band_hz.1 > 300.0);
+    }
+
+    #[test]
+    fn detector_config_from_env_parses_threshold_only() {
+        let _g = EnvGuard::clear_all();
+        std::env::set_var("HOBA_THRESHOLD", "12345");
+        let cfg = DetectorConfig::from_env().expect("threshold override should yield Some");
+        assert!((cfg.power_threshold - 12_345.0).abs() < 1.0);
+        // Buckets fall back to the compile-time default.
+        assert_eq!(cfg.buckets, base_default().buckets);
+    }
+
+    #[test]
+    fn detector_config_from_env_parses_buckets_and_threshold_and_peak_band() {
+        let _g = EnvGuard::clear_all();
+        std::env::set_var("HOBA_BUCKETS", "20:1,30:2,40:3,50:4");
+        std::env::set_var("HOBA_THRESHOLD", "8000.5");
+        std::env::set_var("HOBA_PEAK_BAND", "10:60");
+        let cfg = DetectorConfig::from_env().expect("any override should yield Some");
+        assert_eq!(
+            cfg.buckets,
+            vec![(20.0, 1), (30.0, 2), (40.0, 3), (50.0, 4)]
+        );
+        assert!((cfg.power_threshold - 8_000.5).abs() < 0.001);
+        assert_eq!(cfg.peak_band_hz, (10.0, 60.0));
+    }
+
+    #[test]
+    fn detector_config_from_env_falls_back_on_garbage_buckets() {
+        let _g = EnvGuard::clear_all();
+        std::env::set_var("HOBA_BUCKETS", "this is not a bucket");
+        let cfg = DetectorConfig::from_env().expect("malformed override still yields Some");
+        // Garbage buckets fall back to the compile-time default.
+        assert_eq!(cfg.buckets, base_default().buckets);
+    }
+
+    #[test]
+    fn detector_config_from_env_falls_back_on_garbage_threshold() {
+        let _g = EnvGuard::clear_all();
+        std::env::set_var("HOBA_THRESHOLD", "not-a-number");
+        let cfg = DetectorConfig::from_env().expect("malformed override still yields Some");
+        assert!((cfg.power_threshold - base_default().power_threshold).abs() < 0.001);
+    }
+
+    #[test]
+    fn detector_config_from_env_falls_back_on_inverted_peak_band() {
+        let _g = EnvGuard::clear_all();
+        std::env::set_var("HOBA_PEAK_BAND", "50:10");
+        let cfg = DetectorConfig::from_env().expect("malformed override still yields Some");
+        assert_eq!(cfg.peak_band_hz, base_default().peak_band_hz);
+    }
+
+    /// RAII helper that clears the three HOBA_* env vars before a test runs and
+    /// restores them on drop. Tests in this module mutate process-global state,
+    /// so they're serialised through this guard plus a shared mutex in the
+    /// helper itself (Rust runs unit tests in parallel by default).
+    struct EnvGuard {
+        prior: [(String, Option<String>); 4],
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn clear_all() -> Self {
+            static MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+            let names = [
+                "HOBA_BUCKETS",
+                "HOBA_THRESHOLD",
+                "HOBA_PEAK_BAND",
+                "HOBA_DEBUG",
+            ];
+            let mut prior: [(String, Option<String>); 4] = [
+                (names[0].into(), None),
+                (names[1].into(), None),
+                (names[2].into(), None),
+                (names[3].into(), None),
+            ];
+            for (i, n) in names.iter().enumerate() {
+                prior[i] = ((*n).into(), std::env::var(n).ok());
+                std::env::remove_var(n);
+            }
+            Self { prior, _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, prior) in &self.prior {
+                match prior {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 
     #[cfg(feature = "mic")]
