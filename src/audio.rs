@@ -136,7 +136,7 @@ const INFRASOUND_SAMPLE_RATE: u32 = 44_100;
 
 /// Runtime-tunable detector knobs.
 ///
-/// The default behaviour of [`Detector::new`] / [`Detector::with_source`] is
+/// The default behaviour of [`Detector::with_source`] is
 /// equivalent to `DetectorConfig::release_default()` (or
 /// `DetectorConfig::audible_test()` when the `audible-test` cargo feature is
 /// on). Pass a custom config to [`Detector::with_config`] when you want to
