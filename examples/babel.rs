@@ -22,13 +22,20 @@
 //! HVAC, subway) or to override the band via `HOBA_BUCKETS` / the
 //! `--bands` flag.
 //!
-//! A diagnostic line on stderr shows what the detector is observing:
-//! `[depth=N peak=AAA Hz BB.B dB]`. If `peak_db` stays near silence
+//! Pass `--diagnose` to enable the legacy 250 ms stderr heartbeat:
+//! `[depth=N peak=AAA Hz BB.B dB]`. It is off by default because the line
+//! intermixes with the red BABEL flood and breaks the Patlabor screen
+//! aesthetic. When the heartbeat is on, if `peak_db` stays near silence
 //! (-90 dB or lower) while `--emit` is on, the speaker → mic loopback is
 //! broken (output muted, mic missing/permission denied, BlueTooth headset
 //! splitting in/out, etc.).
+//!
+//! While the detector is compromised (`depth >= 1`), the BABEL flood is
+//! painted in ANSI red — yellow at depth 1, escalating to bold bright red
+//! at depth 4 — to mirror the runaway HOS terminal in Patlabor: The Movie
+//! (1989). Piped / redirected output (no tty) emits plain text instead.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use hoba::audio::{AudioSource, Detector, DetectorConfig, MicSource};
@@ -126,6 +133,25 @@ fn babel_line(depth: u8) -> String {
     "BABEL ".repeat(count).trim_end().to_string()
 }
 
+/// ANSI escape sequence for the BABEL flood at the given compromise depth.
+/// Patlabor: The Movie (1989) shows the runaway HOS terminal in red; we
+/// scale the intensity by depth so the visual escalates with the detector.
+/// `_` (depth 0 or out of range) returns an empty prefix — caller should
+/// not wrap non-flood lines with color anyway.
+fn babel_color_code(depth: u8) -> &'static str {
+    match depth {
+        1 => "\x1b[33m",   // yellow
+        2 => "\x1b[31m",   // red
+        3 => "\x1b[91m",   // bright red
+        4 => "\x1b[1;91m", // bold bright red
+        _ => "",
+    }
+}
+
+/// ANSI reset; paired with `babel_color_code` so terminal state never leaks
+/// past a flood line.
+const ANSI_RESET: &str = "\x1b[0m";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--list-devices") {
@@ -138,6 +164,22 @@ fn main() {
     // (audible-test feature). Under the infrasound release default with no
     // `--bands`, there is nothing meaningful to emit; the demo runs in
     // listen-only mode and waits for real environmental infrasound.
+    // `--diagnose` re-enables the legacy 250 ms `[depth=N peak=... dB]` stderr
+    // heartbeat. Off by default since v0.4.0 / Issue #38: the heartbeat lines
+    // intermix with the BABEL flood and break the Patlabor screen aesthetic.
+    let diagnose = args.iter().any(|a| a == "--diagnose");
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        eprintln!(
+            "usage: babel [--listen|--no-emit] [--bands <hz>:<depth>,...] \
+[--snr <db>] [--threshold <db>] [--diagnose] [--list-devices]"
+        );
+        eprintln!();
+        eprintln!(
+            "  --diagnose   Print heartbeat diagnostic line every 250ms \
+(off by default for clean Patlabor output)."
+        );
+        return;
+    }
     let listen_flag = args.iter().any(|a| a == "--listen" || a == "--no-emit");
     let bands_flag_present = args
         .iter()
@@ -243,12 +285,16 @@ detector somewhere your hardware can actually reach.)"
     let mut next_print = Instant::now();
     let mut next_heartbeat = Instant::now();
 
+    // Decide once whether stdout supports ANSI. Pipes / redirects (`| head`,
+    // `> babel.txt`) get plain text so the captured output stays clean.
+    let stdout_is_tty = std::io::stdout().is_terminal();
+
     loop {
         detector.poll();
         let depth = detector.depth();
         let now = Instant::now();
 
-        if now >= next_heartbeat {
+        if diagnose && now >= next_heartbeat {
             eprintln!(
                 "[depth={} peak={:>5.0} Hz {:>5.1} dB | noise {:>5.1} dB | snr {:>4.1} dB]",
                 depth,
@@ -262,7 +308,12 @@ detector somewhere your hardware can actually reach.)"
 
         if now >= next_print {
             if depth > 0 {
-                println!("{}", babel_line(depth));
+                let line = babel_line(depth);
+                if stdout_is_tty {
+                    println!("{}{}{}", babel_color_code(depth), line, ANSI_RESET);
+                } else {
+                    println!("{line}");
+                }
                 next_print = now + BABEL_CADENCE;
             } else {
                 println!("{}", VERSES[idx % VERSES.len()]);
@@ -272,6 +323,30 @@ detector somewhere your hardware can actually reach.)"
             std::io::stdout().flush().ok();
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn babel_color_code_per_depth() {
+        // Depth 0 / out-of-range yields no escape; flood paths never invoke
+        // this with depth 0, but the empty default keeps the function total.
+        assert_eq!(babel_color_code(0), "");
+        assert_eq!(babel_color_code(1), "\x1b[33m");
+        assert_eq!(babel_color_code(2), "\x1b[31m");
+        assert_eq!(babel_color_code(3), "\x1b[91m");
+        assert_eq!(babel_color_code(4), "\x1b[1;91m");
+        assert_eq!(babel_color_code(5), "");
+        assert_eq!(babel_color_code(255), "");
+    }
+
+    #[test]
+    fn ansi_reset_constant() {
+        // Sanity check: the reset is the canonical CSI 0 m.
+        assert_eq!(ANSI_RESET, "\x1b[0m");
     }
 }
 
