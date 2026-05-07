@@ -7,15 +7,15 @@
 //! cargo run --example babel --features audible-test
 //! ```
 //!
-//! With `--features audible-test` the trigger sits at 1 kHz; the demo
-//! emits that from the default output device, the mic loops it back, and
-//! the detector flips. Pass `--listen` to disable emission and use an
-//! external tone source instead.
+//! With `--features audible-test` the trigger sits at 1.75 kHz (1.0–2.5 kHz
+//! window); the demo emits that from the default output device, the mic
+//! loops it back, and the detector flips. Pass `--listen` to disable
+//! emission and use an external tone source instead.
 //!
 //! Without `--features audible-test`, the detector watches the **release
-//! default** infrasound band — a single 1–10 Hz bucket that fires at depth
-//! 4 anywhere in the window (no graded depth, matching the Patlabor HOS).
-//! No consumer speaker can reproduce that, by design — see
+//! default** infrasound band — a single 1–10 Hz bucket that fires anywhere
+//! in the window. Binary trigger, no graded depth, matching the *Patlabor*
+//! HOS in the film. No consumer speaker can reproduce that, by design — see
 //! `DetectorConfig::release_default` for the rationale. The example will
 //! start, print scripture, and quietly wait. To actually trigger it you
 //! need real environmental infrasound (earthquake, typhoon gust, large
@@ -23,30 +23,30 @@
 //! `--bands` flag.
 //!
 //! Pass `--diagnose` to enable the legacy 250 ms stderr heartbeat:
-//! `[depth=N peak=AAA Hz BB.B dB]`. It is off by default because the line
-//! intermixes with the red BABEL flood and breaks the Patlabor screen
+//! `[peak=AAA Hz BB.B dB | snr CC.C dB]`. It is off by default because the
+//! line intermixes with the red BABEL flood and breaks the Patlabor screen
 //! aesthetic. When the heartbeat is on, if `peak_db` stays near silence
 //! (-90 dB or lower) while `--emit` is on, the speaker → mic loopback is
 //! broken (output muted, mic missing/permission denied, BlueTooth headset
 //! splitting in/out, etc.).
 //!
-//! While the detector is compromised (`depth >= 1`), the BABEL flood is
-//! painted in ANSI red — yellow at depth 1, escalating to bold bright red
-//! at depth 4 — to mirror the runaway HOS terminal in Patlabor: The Movie
-//! (1989). Piped / redirected output (no tty) emits plain text instead.
+//! While the detector is compromised, the BABEL flood is painted in ANSI
+//! red — uniform red, mirroring the runaway HOS terminal in *Patlabor: The
+//! Movie* (1989), which shows the trigger as binary, not graded. Piped /
+//! redirected output (no tty) emits plain text instead.
 
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use hoba::audio::{AudioSource, Detector, DetectorConfig, MicSource};
 
-/// Compile-time hint for `--emit`: the lowest bucket center in the active
-/// preset. Under `audible-test` the example can actually loop this back
-/// through speakers; under the release default (infrasound) it is well
-/// below what cpal will play meaningfully, and emission is forced off
-/// unless the user explicitly supplies their own `--bands`.
+/// Compile-time hint for `--emit`: the bucket centre in the active preset.
+/// Under `audible-test` the example can actually loop this back through
+/// speakers; under the release default (infrasound) it is well below what
+/// cpal will play meaningfully, and emission is forced off unless the user
+/// explicitly supplies their own `--bands`.
 #[cfg(feature = "audible-test")]
-const TRIGGER_HZ: f32 = 1_000.0;
+const TRIGGER_HZ: f32 = 1_750.0;
 /// Centre of the single 1–10 Hz infrasound bucket under the release
 /// default. Used as the `--emit` fallback frequency, but cpal cannot
 /// meaningfully play it — the demo forces listen-only mode below.
@@ -59,36 +59,31 @@ const DEFAULT_BAND_PLAYABLE: bool = true;
 #[cfg(not(feature = "audible-test"))]
 const DEFAULT_BAND_PLAYABLE: bool = false;
 
-/// Parses `--bands "<hz>:<depth>,..."` into a `Vec<(f32, u8)>`. Each item must
-/// carry an explicit depth (1..=4). Whitespace tolerated; empty list rejected.
-fn parse_bands_arg(s: &str) -> Result<Vec<(f32, u8)>, String> {
+/// Parses `--bands "<hz>,<hz>,..."` into a `Vec<f32>`. Whitespace tolerated;
+/// empty list rejected. For back-compat with v0.4.x the legacy `hz:depth`
+/// form is also accepted — the `:depth` portion is silently dropped because
+/// the graded depth concept was removed in v0.5.0.
+fn parse_bands_arg(s: &str) -> Result<Vec<f32>, String> {
     let mut out = Vec::new();
     for part in s.split(',') {
         let trimmed = part.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let (hz_s, d_s) = trimmed
-            .split_once(':')
-            .ok_or_else(|| format!("'{trimmed}' missing ':<depth>'"))?;
-        let hz: f32 = hz_s
-            .trim()
+        let hz_str = match trimmed.split_once(':') {
+            Some((hz, _)) => hz.trim(),
+            None => trimmed,
+        };
+        let hz: f32 = hz_str
             .parse()
-            .map_err(|e| format!("center_hz '{hz_s}' invalid: {e}"))?;
-        let d: u8 = d_s
-            .trim()
-            .parse()
-            .map_err(|e| format!("depth '{d_s}' invalid: {e}"))?;
-        if !(1..=4).contains(&d) {
-            return Err(format!("depth must be 1..=4: {d}"));
-        }
+            .map_err(|e| format!("center_hz '{hz_str}' invalid: {e}"))?;
         if !hz.is_finite() || hz <= 0.0 {
             return Err(format!("center_hz must be positive and finite: {hz}"));
         }
-        out.push((hz, d));
+        out.push(hz);
     }
     if out.is_empty() {
-        return Err("--bands needs at least one '<hz>:<depth>' item".into());
+        return Err("--bands needs at least one '<hz>' item".into());
     }
     Ok(out)
 }
@@ -127,25 +122,20 @@ const SCRIPTURE_CADENCE: Duration = Duration::from_millis(1500);
 const BABEL_CADENCE: Duration = Duration::from_millis(50);
 const HEARTBEAT_CADENCE: Duration = Duration::from_millis(250);
 
-fn babel_line(depth: u8) -> String {
-    // depth 1: 16 words, depth 4: 40 words — terminal fills faster the deeper it goes.
-    let count = 8 + (depth as usize) * 8;
-    "BABEL ".repeat(count).trim_end().to_string()
+/// 24 BABEL words per flood line. The `Patlabor` HOS terminal fills with a
+/// uniform sea of "BABEL" — no per-line growth, no graded staircase. Single
+/// fixed value matches the binary-trigger spirit of the v0.5.0 detector.
+const BABEL_WORDS_PER_LINE: usize = 24;
+
+fn babel_line() -> String {
+    "BABEL ".repeat(BABEL_WORDS_PER_LINE).trim_end().to_string()
 }
 
-/// ANSI escape sequence for the BABEL flood. Patlabor: The Movie (1989) shows
-/// the runaway HOS terminal in a single uniform red — the trigger is binary,
-/// not graded, and the visual matches. `_` (depth 0) returns an empty prefix
-/// so non-flood scripture lines stay in the terminal's default color.
-fn babel_color_code(depth: u8) -> &'static str {
-    if depth >= 1 {
-        "\x1b[31m" // red — Patlabor canon, all depths
-    } else {
-        ""
-    }
-}
+/// ANSI escape sequence for the BABEL flood — uniform red, mirroring the
+/// runaway HOS terminal in *Patlabor: The Movie* (1989).
+const BABEL_COLOR_CODE: &str = "\x1b[31m";
 
-/// ANSI reset; paired with `babel_color_code` so terminal state never leaks
+/// ANSI reset; paired with `BABEL_COLOR_CODE` so terminal state never leaks
 /// past a flood line.
 const ANSI_RESET: &str = "\x1b[0m";
 
@@ -161,13 +151,13 @@ fn main() {
     // (audible-test feature). Under the infrasound release default with no
     // `--bands`, there is nothing meaningful to emit; the demo runs in
     // listen-only mode and waits for real environmental infrasound.
-    // `--diagnose` re-enables the legacy 250 ms `[depth=N peak=... dB]` stderr
-    // heartbeat. Off by default since v0.4.0 / Issue #38: the heartbeat lines
-    // intermix with the BABEL flood and break the Patlabor screen aesthetic.
+    // `--diagnose` re-enables the legacy 250 ms stderr heartbeat. Off by
+    // default since v0.4.0 / Issue #38: the heartbeat lines intermix with
+    // the BABEL flood and break the Patlabor screen aesthetic.
     let diagnose = args.iter().any(|a| a == "--diagnose");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!(
-            "usage: babel [--listen|--no-emit] [--bands <hz>:<depth>,...] \
+            "usage: babel [--listen|--no-emit] [--bands <hz>,...] \
 [--snr <db>] [--threshold <db>] [--diagnose] [--list-devices]"
         );
         eprintln!();
@@ -196,10 +186,9 @@ fn main() {
         },
         None => None,
     };
-    // Demo accepts either flag spelling for the SNR threshold (in dB) since
-    // v0.4.0; `--threshold` is the deprecated alias for `--snr`. Either way
-    // the value is interpreted as a dB SNR — no longer the v0.3.x raw-power
-    // knob.
+    // Demo accepts either flag spelling for the SNR threshold (in dB);
+    // `--threshold` is the deprecated alias for `--snr`. Either way the
+    // value is interpreted as a dB SNR — no longer the v0.3.x raw-power knob.
     let snr_override =
         match parse_value_arg(&args, "--snr").or_else(|| parse_value_arg(&args, "--threshold")) {
             Some(s) => match s.trim().parse::<f32>() {
@@ -214,11 +203,11 @@ fn main() {
 
     if !DEFAULT_BAND_PLAYABLE && !bands_flag_present {
         eprintln!(
-            "(release default: a single 1–10 Hz infrasound bucket, depth 4. \
-No consumer speaker can play this; the demo will sit quietly until your \
-office HVAC kicks in or a typhoon strolls past. Use --features audible-test \
-for a 1 kHz loopback demo, or --bands <hz>:<depth>,... to point the \
-detector somewhere your hardware can actually reach.)"
+            "(release default: a single 1–10 Hz infrasound bucket. No consumer \
+speaker can play this; the demo will sit quietly until your office HVAC \
+kicks in or a typhoon strolls past. Use --features audible-test for a \
+1.75 kHz loopback demo, or --bands <hz>,... to point the detector \
+somewhere your hardware can actually reach.)"
         );
     }
 
@@ -234,11 +223,9 @@ detector somewhere your hardware can actually reach.)"
     let emit_hz = bands_override
         .as_ref()
         .and_then(|v| {
-            v.iter()
-                .map(|(hz, _)| *hz)
-                .fold(None, |acc: Option<f32>, hz| {
-                    Some(acc.map_or(hz, |a| a.min(hz)))
-                })
+            v.iter().copied().fold(None, |acc: Option<f32>, hz| {
+                Some(acc.map_or(hz, |a| a.min(hz)))
+            })
         })
         .unwrap_or(TRIGGER_HZ);
 
@@ -288,13 +275,13 @@ detector somewhere your hardware can actually reach.)"
 
     loop {
         detector.poll();
-        let depth = detector.depth();
+        let triggered = detector.is_compromised();
         let now = Instant::now();
 
         if diagnose && now >= next_heartbeat {
             eprintln!(
-                "[depth={} peak={:>5.0} Hz {:>5.1} dB | noise {:>5.1} dB | snr {:>4.1} dB]",
-                depth,
+                "[trigger={} peak={:>5.0} Hz {:>5.1} dB | noise {:>5.1} dB | snr {:>4.1} dB]",
+                triggered,
                 detector.peak_hz(),
                 detector.peak_db(),
                 detector.noise_floor_db(),
@@ -304,10 +291,10 @@ detector somewhere your hardware can actually reach.)"
         }
 
         if now >= next_print {
-            if depth > 0 {
-                let line = babel_line(depth);
+            if triggered {
+                let line = babel_line();
                 if stdout_is_tty {
-                    println!("{}{}{}", babel_color_code(depth), line, ANSI_RESET);
+                    println!("{}{}{}", BABEL_COLOR_CODE, line, ANSI_RESET);
                 } else {
                     println!("{line}");
                 }
@@ -328,22 +315,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn babel_color_code_per_depth() {
-        // Depth 0 / out-of-range yields no escape; flood paths never invoke
-        // this with depth 0, but the empty default keeps the function total.
-        assert_eq!(babel_color_code(0), "");
-        assert_eq!(babel_color_code(1), "\x1b[31m");
-        assert_eq!(babel_color_code(2), "\x1b[31m");
-        assert_eq!(babel_color_code(3), "\x1b[31m");
-        assert_eq!(babel_color_code(4), "\x1b[31m");
-        assert_eq!(babel_color_code(5), "\x1b[31m");
-        assert_eq!(babel_color_code(255), "\x1b[31m");
+    fn babel_color_code_constant() {
+        // Patlabor canon: uniform red while the trigger is active.
+        assert_eq!(BABEL_COLOR_CODE, "\x1b[31m");
     }
 
     #[test]
     fn ansi_reset_constant() {
         // Sanity check: the reset is the canonical CSI 0 m.
         assert_eq!(ANSI_RESET, "\x1b[0m");
+    }
+
+    #[test]
+    fn babel_line_is_uniform_word_count() {
+        // Single-value flood — no graded depth means the same line every time.
+        let line = babel_line();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(words.len(), BABEL_WORDS_PER_LINE);
+        assert!(words.iter().all(|w| *w == "BABEL"));
     }
 }
 

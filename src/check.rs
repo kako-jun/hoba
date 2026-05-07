@@ -84,13 +84,12 @@ impl BandResult {
 /// Renders the result table that goes to stdout. Pure function: deterministic
 /// output for fixed inputs, no clocks, no devices, no formatting locale.
 ///
-/// Columns since v0.4.0: `peak_db` (signal level), `noise_db` (median floor
-/// outside the bucket), `snr_db` (the difference, the actual quantity the
-/// verdict checks against `snr_threshold_db`). Three columns instead of one
-/// because the "PASS at -49 dB / FAIL at -50 dB" v0.3.x output was
-/// fundamentally unreproducible across hosts: a -50 dB peak in a -90 dB
-/// quiet room is an obvious signal, the same -50 dB peak in a -45 dB noisy
-/// room is meaningless.
+/// Columns: `peak_db` (signal level), `noise_db` (median floor outside the
+/// bucket), `snr_db` (the difference, the actual quantity the verdict checks
+/// against `snr_threshold_db`). The "PASS at -49 dB / FAIL at -50 dB" v0.3.x
+/// output was fundamentally unreproducible across hosts: a -50 dB peak in a
+/// -90 dB quiet room is an obvious signal, the same -50 dB peak in a -45 dB
+/// noisy room is meaningless.
 pub fn format_results(results: &[BandResult]) -> String {
     let mut out = String::new();
     out.push_str("band  target_hz  detected_hz  peak_db    noise_db    snr_db   verdict\n");
@@ -156,25 +155,25 @@ pub fn decide_verdict(results: &[BandResult]) -> bool {
 }
 
 /// Parses the `--bands` argument: a comma-separated list of positive Hz
-/// values. Each item may optionally be suffixed with `:<depth>` (1..=4)
-/// — this form is consumed by [`parse_bands_with_depth`]; the plain
-/// frequency form keeps the historical contract (depth-agnostic). Mixing
-/// the two forms in one list is allowed: items without `:depth` simply
-/// have their depth dropped here.
-///
-/// Whitespace around items is tolerated; empty list rejected so the CLI
-/// never silently runs zero bands.
+/// values. For back-compat with v0.4.x, each item may optionally be
+/// suffixed with `:<depth>` — the `:depth` portion is silently dropped
+/// because the graded depth concept was removed in v0.5.0. Whitespace
+/// around items is tolerated; empty list rejected so the CLI never
+/// silently runs zero bands.
 pub fn parse_bands(s: &str) -> Result<Vec<f32>, String> {
     let mut out = Vec::new();
+    let mut saw_legacy_depth = false;
     for part in s.split(',') {
         let trimmed = part.trim();
         if trimmed.is_empty() {
             continue;
         }
-        // Accept "<hz>:<depth>" by ignoring the depth at this layer; full
-        // pair-aware parsing lives in `parse_bands_with_depth`.
+        // Accept the v0.4.x "<hz>:<depth>" form by ignoring the depth.
         let hz_str = match trimmed.split_once(':') {
-            Some((hz, _)) => hz.trim(),
+            Some((hz, _)) => {
+                saw_legacy_depth = true;
+                hz.trim()
+            }
             None => trimmed,
         };
         let hz: f32 = hz_str
@@ -188,42 +187,11 @@ pub fn parse_bands(s: &str) -> Result<Vec<f32>, String> {
     if out.is_empty() {
         return Err("--bands needs at least one frequency".into());
     }
-    Ok(out)
-}
-
-/// Parses the `--bands` argument as `<hz>[:<depth>]` pairs. Items missing
-/// the `:depth` suffix get a default depth from their 1-based position
-/// (clamped to 1..=4) so callers always end up with `(f32, u8)` pairs
-/// usable for [`crate::audio::DetectorConfig::buckets`]. Whitespace around
-/// items is tolerated; empty list rejected.
-pub fn parse_bands_with_depth(s: &str) -> Result<Vec<(f32, u8)>, String> {
-    let mut out = Vec::new();
-    for (i, part) in s.split(',').enumerate() {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (hz_s, depth_opt) = match trimmed.split_once(':') {
-            Some((hz, d)) => (hz.trim(), Some(d.trim())),
-            None => (trimmed, None),
-        };
-        let hz: f32 = hz_s
-            .parse()
-            .map_err(|e| format!("invalid frequency '{hz_s}': {e}"))?;
-        if !hz.is_finite() || hz <= 0.0 {
-            return Err(format!("frequency must be positive and finite: {hz_s}"));
-        }
-        let depth: u8 = match depth_opt {
-            Some(d) => d.parse().map_err(|e| format!("invalid depth '{d}': {e}"))?,
-            None => ((i + 1).min(4)) as u8,
-        };
-        if !(1..=4).contains(&depth) {
-            return Err(format!("depth must be 1..=4: {depth}"));
-        }
-        out.push((hz, depth));
-    }
-    if out.is_empty() {
-        return Err("--bands needs at least one frequency".into());
+    if saw_legacy_depth && std::env::var("HOBA_DEBUG").as_deref() == Ok("1") {
+        eprintln!(
+            "hoba: --bands legacy 'hz:depth' form detected; ':depth' ignored — \
+             the graded depth concept was removed in v0.5.0."
+        );
     }
     Ok(out)
 }
@@ -460,7 +428,7 @@ mod runner {
         // beyond the bucket window itself so the noise-floor estimate has bins
         // outside the bucket to draw on.
         let mut config = crate::audio::DetectorConfig::release_default();
-        config.buckets = vec![(target_hz, 1)];
+        config.buckets = vec![target_hz];
         let lo = (target_hz - SEARCH_HALF_WIDTH_HZ).max(0.0);
         let hi = target_hz + SEARCH_HALF_WIDTH_HZ;
         // bucket_half_width_hz controls both the SNR bucket window and which
@@ -563,34 +531,12 @@ mod tests {
         assert!(parse_bands("19000,xyz").is_err());
     }
 
+    /// Back-compat with the v0.4.x `hz:depth` form: the depth must be
+    /// silently dropped, leaving a plain frequency list.
     #[test]
-    fn parse_bands_accepts_hz_depth_pairs_dropping_depth() {
+    fn parse_bands_accepts_legacy_hz_depth_pairs_dropping_depth() {
         let v = parse_bands("19000:1,19500:2,20000:3").unwrap();
         assert_eq!(v, vec![19_000.0, 19_500.0, 20_000.0]);
-    }
-
-    #[test]
-    fn parse_bands_with_depth_explicit_pairs() {
-        let v = parse_bands_with_depth("100:1,200:2,300:3,400:4").unwrap();
-        assert_eq!(v, vec![(100.0, 1), (200.0, 2), (300.0, 3), (400.0, 4)]);
-    }
-
-    #[test]
-    fn parse_bands_with_depth_fills_missing_depth_by_position() {
-        let v = parse_bands_with_depth("100,200,300").unwrap();
-        assert_eq!(v, vec![(100.0, 1), (200.0, 2), (300.0, 3)]);
-    }
-
-    #[test]
-    fn parse_bands_with_depth_rejects_zero_or_oversized_depth() {
-        assert!(parse_bands_with_depth("100:0").is_err());
-        assert!(parse_bands_with_depth("100:5").is_err());
-    }
-
-    #[test]
-    fn parse_bands_with_depth_rejects_empty_input() {
-        assert!(parse_bands_with_depth("").is_err());
-        assert!(parse_bands_with_depth(" , ").is_err());
     }
 
     #[test]

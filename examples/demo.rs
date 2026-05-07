@@ -7,14 +7,11 @@
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-fn state_label(depth: u8) -> &'static str {
-    match depth {
-        0 => " --   ",
-        1 => "mode 1",
-        2 => "mode 2",
-        3 => "mode 3",
-        4 => "mode 4",
-        _ => " ??   ",
+fn state_label(triggered: bool) -> &'static str {
+    if triggered {
+        "TRIGGER"
+    } else {
+        "  --   "
     }
 }
 
@@ -45,11 +42,11 @@ fn main() {
 
     loop {
         let roll = hoba::randint(1, 6);
-        let depth = hoba::compromised_depth();
+        let triggered = hoba::is_compromised();
         println!(
             "{}  roll={roll}  monitor={}",
             wall_clock_hms(),
-            state_label(depth)
+            state_label(triggered)
         );
         std::io::stdout().flush().ok();
         std::thread::sleep(Duration::from_secs(1));

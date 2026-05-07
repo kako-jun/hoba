@@ -11,26 +11,34 @@ when you do not need the full surface of `rand`.
 
 ## Why infrasound is the default
 
-Starting with v0.4.0, the release default of `hoba`'s environmental quality
-monitor watches **a single 1–10 Hz infrasound bucket that fires at depth 4
-on frequency presence** — i.e. the moment any tone in 1–10 Hz beats the
-ambient noise floor by at least 6 dB SNR, the detector trips. Two design
-choices matter, and they both come from *Patlabor*:
+The release default of `hoba`'s environmental quality monitor watches **a
+single 1–10 Hz infrasound bucket that flips on frequency presence** — i.e.
+the moment any tone in 1–10 Hz beats the ambient noise floor by at least
+6 dB SNR, the detector trips. While the trigger is active, the **least
+significant bit of every `random_u64()` is cleared** (mask
+`0xFFFF_FFFF_FFFF_FFFE`, output forced even). Three design choices matter,
+and they all come from either *Patlabor* or the original `hoba` design:
 
-- **One bucket, one depth.** In *Patlabor: The Movie* (1989), the HOS /
-  バビロンプロジェクト trigger is binary: it fires or it doesn't. There is no
-  "depth 1" or "depth 3" graded version of the building-wind resonance in
-  the film. `hoba`'s release default takes that literally — a single bucket
-  spans 1.0–10.0 Hz, and any tone in that window pushes the mask depth
-  straight to 4.
+- **One bucket. Binary trigger. No graded depth.** In *Patlabor: The
+  Movie* (1989), the HOS / バビロンプロジェクト trigger is binary: it
+  fires or it doesn't. `hoba` 0.5.0 returns to that exactly — a single
+  bucket spans 1.0–10.0 Hz, and any tone in that window flips the
+  detector. The 1–4 bit graded depth that lived in 0.2.0–0.4.x is gone;
+  the mask is fixed at LSB 1-bit, matching the original design in
+  `notes/dev/hoba.md`.
 - **Frequency presence, not amplitude.** The v0.3.x detector tested an
   absolute raw-power threshold, which silently re-calibrates with mic gain,
-  room tone, and per-host noise floor. v0.4.0 replaces that with a **6 dB
-  SNR check against a per-poll noise-floor estimate** (median bin power
-  inside the trigger band, excluding the bucket's own window). The question
-  the detector answers is "is the frequency present?", not "is the
-  amplitude over my hand-tuned constant?" — closer to what the HOS lore
-  actually requires.
+  room tone, and per-host noise floor. v0.4.0+ uses a **6 dB SNR check
+  against a per-poll noise-floor estimate** (median bin power inside the
+  trigger band, excluding the bucket's own window). The question the
+  detector answers is "is the frequency present?", not "is the amplitude
+  over my hand-tuned constant?" — closer to what the HOS lore actually
+  requires.
+- **Deterministic bias.** A binary trigger plus a fixed LSB-1 mask gives
+  every triggered draw the same shape: output is even. Hidden features
+  built on top (gacha biased toward even index, A/B test biased toward
+  arm A, …) can be designed without worrying that depth 1 and depth 4
+  paint different bits.
 
 1–10 Hz is physically below what any consumer playback chain reproduces. A
 laptop will not trigger this default by accident; a phone will not; a
@@ -41,15 +49,16 @@ in everyday life" is the whole point. The default is supposed to fire on the
 day you have already forgotten you ever depended on `hoba`.
 
 If you actually want a band you can demo through speakers, you have two
-options without recompiling: the `audible-test` cargo feature (1–2.5 kHz),
-or `HOBA_BUCKETS` to point the detector anywhere your hardware can reach.
-See [Configuration](#configuration).
+options without recompiling: the `audible-test` cargo feature (single
+bucket at 1.75 kHz, 1.0–2.5 kHz window), or `HOBA_BUCKETS` to point the
+detector anywhere your hardware can reach. See
+[Configuration](#configuration).
 
 ## Quickstart
 
 ```toml
 [dependencies]
-hoba = "0.4"
+hoba = "0.5"
 ```
 
 ```rust
@@ -65,13 +74,12 @@ That is the whole user-facing surface for normal use.
 
 When the `mic` feature is enabled (default), `hoba` runs a lightweight
 background monitor that observes ambient acoustic conditions. While
-those conditions appear to be affecting entropy quality, the low bits
-of every `random_u64` result are masked. Two functions surface the
-state:
+those conditions appear to be affecting entropy quality, the **LSB** of
+every `random_u64` result is cleared (mask `0xFFFF_FFFF_FFFF_FFFE`, output
+forced even). One function surfaces the state:
 
 ```rust
 hoba::is_compromised();      // bool — false in normal conditions
-hoba::compromised_depth();   // u8   — 0 in normal conditions
 ```
 
 Security-sensitive callers should check `is_compromised()` and either
@@ -81,7 +89,7 @@ To opt out of the monitor entirely:
 
 ```toml
 [dependencies]
-hoba = { version = "0.4", default-features = false }
+hoba = { version = "0.5", default-features = false }
 ```
 
 ## Configuration
@@ -94,18 +102,22 @@ The detector ships with two presets and accepts arbitrary runtime overrides
 ```rust
 use hoba::audio::{Detector, DetectorConfig, MicSource};
 
-// Production default: a single 1–10 Hz infrasound bucket at depth 4,
-// 6 dB SNR threshold. Will not fire on consumer audio — by design.
+// Production default: single 1–10 Hz infrasound bucket, 6 dB SNR
+// threshold. Binary trigger, no graded depth. Will not fire on consumer
+// audio — by design.
 let cfg = DetectorConfig::release_default();
 
 // Audible-band preset, reachable from a release build (no `audible-test`
-// feature needed). Use this for development, CI, and live demos.
+// feature needed). Single bucket centred at 1.75 kHz, 1.0–2.5 kHz window
+// — structurally symmetric to release_default. Use this for development,
+// CI, and live demos.
 let cfg = DetectorConfig::audible_test();
 
-// Custom: sub-bass HVAC monitor, 20–50 Hz graded bucket, stricter SNR.
-// Reachable through a bass amp / subwoofer.
+// Custom: sub-bass HVAC monitor, 20–50 Hz buckets, stricter SNR.
+// Reachable through a bass amp / subwoofer. Any of the four centres
+// firing is enough to flip the detector.
 let cfg = DetectorConfig {
-    buckets: vec![(20.0, 1), (30.0, 2), (40.0, 3), (50.0, 4)],
+    buckets: vec![20.0, 30.0, 40.0, 50.0],
     snr_threshold_db: 10.0,
     peak_band_hz: (10.0, 60.0),
     sample_rate: 48_000,
@@ -123,26 +135,31 @@ override the compile-time default:
 
 | Var              | Format                                    | Example                            |
 | ---------------- | ----------------------------------------- | ---------------------------------- |
-| `HOBA_BUCKETS`   | `<center_hz>:<depth>,…` (depth 1..=4)     | `HOBA_BUCKETS=1:1,3:2,5:3,10:4`    |
+| `HOBA_BUCKETS`   | `<center_hz>,…` (comma-separated Hz)      | `HOBA_BUCKETS=1,3,5,10`            |
 | `HOBA_SNR`       | non-negative dB SNR threshold (default 6) | `HOBA_SNR=10`                      |
 | `HOBA_PEAK_BAND` | `<lo_hz>:<hi_hz>` (peak / floor band)     | `HOBA_PEAK_BAND=10:60`             |
 
 Parse failures fall back silently to the default. Set `HOBA_DEBUG=1` to
 surface them on stderr.
 
-> **Deprecated since v0.4.0:** `HOBA_THRESHOLD` was the v0.3.x raw band-power
-> knob. Its unit (post-FFT power) does not translate to the new dB SNR
-> threshold, so v0.4.0 ignores the value and prints a one-line deprecation
-> warning under `HOBA_DEBUG=1`. Use `HOBA_SNR` instead.
+> **Removed in v0.5.0:** the legacy `HOBA_BUCKETS=hz:depth,…` form is still
+> parsed for back-compat, but the `:depth` portion is ignored. The graded
+> depth concept was retired with v0.5.0; under `HOBA_DEBUG=1` a one-line
+> warning is printed.
+>
+> **Deprecated since v0.4.0:** `HOBA_THRESHOLD` was the v0.3.x raw
+> band-power knob. Its unit (post-FFT power) does not translate to the dB
+> SNR threshold, so its value is ignored and a one-line deprecation warning
+> is printed under `HOBA_DEBUG=1`. Use `HOBA_SNR` instead.
 
 ### Picking a band
 
 | Use case                                                 | Suggested config                                            |
 | -------------------------------------------------------- | ----------------------------------------------------------- |
 | Infrasound 1–10 Hz (default — earthquake, HVAC, gusts)   | leave unset — release default                               |
-| Graded infrasound 1 / 3 / 5 / 10 Hz (legacy v0.3 layout) | `HOBA_BUCKETS=1:1,3:2,5:3,10:4`                             |
-| Sub-bass 20–50 Hz (bass amp, subway, big HVAC)           | `HOBA_BUCKETS=20:1,30:2,40:3,50:4` `HOBA_SNR=10`            |
-| Audible-test 1–2.5 kHz (CI / live demos)                 | `HOBA_BUCKETS=1000:1,1500:2,2000:3,2500:4`                  |
+| Multi-point infrasound 1 / 3 / 5 / 10 Hz                 | `HOBA_BUCKETS=1,3,5,10`                                     |
+| Sub-bass 20–50 Hz (bass amp, subway, big HVAC)           | `HOBA_BUCKETS=20,30,40,50` `HOBA_SNR=10`                    |
+| Audible-test 1.75 kHz (CI / live demos)                  | `HOBA_BUCKETS=1750`                                         |
 
 The `audible-test` cargo feature still exists as a convenience preset that
 flips the compile-time default to 1–2.5 kHz. It is no longer the only path
@@ -175,7 +192,7 @@ floor for the production detector to fire:
 hoba check                            # default 19/19.5/20/20.5 kHz, 5 s each
 hoba check --list-devices             # enumerate cpal inputs/outputs
 hoba check --bands 100,200,300        # arbitrary bands, no recompile
-hoba check --bands 19000:1,19500:2    # explicit (hz:depth) pairs
+hoba check --bands 19000:1,19500:2    # legacy form: ':depth' silently dropped
 hoba check --snr 10                   # tighten the SNR threshold to 10 dB
 hoba check --threshold 10             # deprecated alias for --snr (still dB)
 ```
@@ -219,6 +236,31 @@ Three common scenarios:
    ```bash
    hoba check --listen-only
    ```
+
+## Migrating from v0.4.x to v0.5
+
+v0.5.0 removed the graded depth concept. Three breaking changes:
+
+| v0.4.x                                     | v0.5.0                                  |
+| ------------------------------------------ | --------------------------------------- |
+| `buckets: Vec<(f32, u8)>`                  | `buckets: Vec<f32>`                     |
+| `Detector::compromised_depth() -> u8`      | `Detector::is_compromised() -> bool`    |
+| `hoba::compromised_depth() -> u8`          | `hoba::is_compromised() -> bool`        |
+| `HOBA_BUCKETS=hz:depth,…`                  | `HOBA_BUCKETS=hz,hz,hz`                 |
+| Mask: 1–4 LSBs cleared (depth-graded)      | Mask: LSB only (`0xFFFF…FFFE`, even)    |
+
+Backwards compatibility: `HOBA_BUCKETS=hz:depth,…` and `hoba check --bands
+hz:depth,…` are still accepted — the `:depth` portion is silently dropped
+and, when `HOBA_DEBUG=1`, a one-line warning notes that the depth concept
+was removed in v0.5.0. Source-level callers that passed `(f32, u8)` tuples
+in struct literals or that read `compromised_depth()` must update.
+
+The motivation for the removal is on Issue #40: the v0.4.x graded depth
+inherited from PR #5 contradicted the binary HOS lore in *Patlabor: The
+Movie* (1989), and the residual `(f32, u8)` shape kept it alive in
+`audible_test()` and on the public API even after v0.4.0 had collapsed
+the production default to a single bucket. v0.5.0 finishes the job and
+returns the library to the original `notes/dev/hoba.md` design.
 
 ## Documentation
 
