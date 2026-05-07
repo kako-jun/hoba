@@ -35,9 +35,9 @@ enum Cmd {
     /// production trigger would fire on this device.
     Check {
         /// Comma-separated frequencies in Hz to probe (e.g. `19000,19500`).
-        /// Each item may optionally carry a `:depth` suffix (`19000:1,19500:2`)
-        /// — the depth is informational here and only affects the underlying
-        /// detector configuration, not the per-band PASS/FAIL verdict.
+        /// For back-compat with v0.4.x, items may carry a `:depth` suffix
+        /// (`19000:1,19500:2`) — the `:depth` portion is silently dropped
+        /// because the graded depth concept was removed in v0.5.0.
         #[arg(long)]
         bands: Option<String>,
         /// Per-band measurement duration in seconds.
@@ -304,10 +304,7 @@ fn format_event(e: &Event) -> String {
     } else {
         format!("{}ms", e.duration_ms)
     };
-    format!(
-        "{}  {:.2} kHz  {:.0} dB  {:>6}  depth {}",
-        time, khz, e.peak_db, dur, e.depth
-    )
+    format!("{}  {:.2} kHz  {:.0} dB  {:>6}", time, khz, e.peak_db, dur)
 }
 
 #[cfg(test)]
@@ -371,14 +368,12 @@ mod tests {
             peak_hz: 19120.5,
             peak_db: -32.1,
             duration_ms: 850,
-            depth: 1,
         };
         let s = format_event(&e);
         assert!(s.contains("13:42:11"));
         assert!(s.contains("19.12 kHz"));
         assert!(s.contains("-32 dB"));
         assert!(s.contains("850ms"));
-        assert!(s.contains("depth 1"));
     }
 
     #[test]
@@ -388,12 +383,10 @@ mod tests {
             peak_hz: 20300.0,
             peak_db: -28.0,
             duration_ms: 1200,
-            depth: 3,
         };
         let s = format_event(&e);
         assert!(s.contains("15:08:33"));
         assert!(s.contains("20.30 kHz"));
         assert!(s.contains("1.2s"));
-        assert!(s.contains("depth 3"));
     }
 }

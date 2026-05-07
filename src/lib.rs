@@ -6,17 +6,19 @@
 //!
 //! When the `mic` feature is enabled (default), a background thread monitors
 //! the default audio input for an environmental trigger tone. While that
-//! trigger is active, the low bits of every `random_u64()` result are
-//! cleared. The number of cleared bits (1–4) depends on which bucket is
-//! dominant within the configured band; the release default is a single
-//! 1–10 Hz infrasound bucket that fires at depth 4 anywhere in the window
-//! (see [`audio::DetectorConfig::release_default`]).
+//! trigger is active, the **least significant bit** of every `random_u64()`
+//! result is cleared (mask `0xFFFF_FFFF_FFFF_FFFE`, even-only output). The
+//! release default is a single 1–10 Hz infrasound bucket — anywhere in the
+//! window flips the trigger (see [`audio::DetectorConfig::release_default`]).
+//! The graded 1–4 bit "depth" mask from v0.4.x and earlier was removed in
+//! v0.5.0; the mask is binary, matching both the original `notes/dev/hoba.md`
+//! design and the binary HOS trigger in *Patlabor: The Movie* (1989).
 //! Security-sensitive callers should check [`is_compromised`] and either
 //! skip RNG calls or fall back to another source.
 //!
 //! When the `whiten` feature is also enabled, callers can opt into a
 //! whitening pipeline that mixes OS entropy with CPU jitter (and `rdrand`
-//! on x86) and passes the mix through BLAKE3 before the bucket mask is
+//! on x86) and passes the mix through BLAKE3 before the trigger mask is
 //! applied. The pipeline defaults to off; toggle at runtime via
 //! `set_whitening`. The mask is always applied last, so the trigger
 //! behavior remains observable through whitened output.
@@ -27,18 +29,21 @@
 //!
 //! The auto-spawned detector picks up runtime configuration from three
 //! optional env vars (no recompile needed):
-//! `HOBA_BUCKETS=20:1,30:2,40:3,50:4` (center_hz:depth pairs),
+//! `HOBA_BUCKETS=20,30,40,50` (comma-separated centre Hz),
 //! `HOBA_SNR=6` (dB SNR threshold; default 6, replaces v0.3.x's
 //! `HOBA_THRESHOLD` raw-power knob), and
 //! `HOBA_PEAK_BAND=18:55` (lo:hi Hz for peak reporting and the noise-floor
-//! estimate). See [`audio::DetectorConfig`] for the library equivalent.
+//! estimate). The legacy `HOBA_BUCKETS=hz:depth,…` form is still parsed for
+//! back-compat but the `:depth` portion is ignored — the depth concept was
+//! removed in v0.5.0. See [`audio::DetectorConfig`] for the library
+//! equivalent.
 //!
 //! When the `log` feature is enabled (off by default), the detector
 //! appends one JSON line to a per-host event log on every quiet → trigger
 //! → quiet cycle. Read recent events back via [`recent_events`].
 //!
-//! For diagnosing a quiet host, three read-only counters complement
-//! [`is_compromised`] / [`compromised_depth`]:
+//! For diagnosing a quiet host, two read-only counters complement
+//! [`is_compromised`]:
 //! [`audio_active`] reports whether the background detector is reading
 //! live audio (mic feature), and [`dropped_event_count`] tallies events
 //! the on-disk log silently rejected (log feature). Together they
@@ -56,9 +61,17 @@ use getrandom::getrandom;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "log")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 
-static COMPROMISED_DEPTH: AtomicU8 = AtomicU8::new(0);
+/// Mask applied to `random_u64` while the detector reports compromise.
+/// Clears the least significant bit, forcing every output to be even —
+/// restoring the original `notes/dev/hoba.md` design where any single
+/// binary decision (gacha index parity, A/B test arm, etc.) collapses to
+/// one side. Hidden features built on hoba can lean on this deterministic
+/// shape without worrying about graded depth surprising downstream logic.
+const COMPROMISE_MASK: u64 = 0xFFFF_FFFF_FFFF_FFFE;
+
+static COMPROMISED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "whiten")]
 static WHITEN_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -104,14 +117,15 @@ fn ensure_detector_running() {
         return;
     }
     INIT.call_once(|| {
-        // If the detector loop ever exits (panic, mic disappears), clear the depth so
-        // the library degrades to plain RNG instead of latching the last compromised state.
-        // Same goes for MIC_ACTIVE: any callers polling audio_active() should observe the
-        // monitor going inactive once the thread is gone.
+        // If the detector loop ever exits (panic, mic disappears), clear the
+        // compromise flag so the library degrades to plain RNG instead of
+        // latching the last compromised state. Same goes for MIC_ACTIVE: any
+        // callers polling audio_active() should observe the monitor going
+        // inactive once the thread is gone.
         struct ClearOnDrop;
         impl Drop for ClearOnDrop {
             fn drop(&mut self) {
-                COMPROMISED_DEPTH.store(0, Ordering::Release);
+                COMPROMISED.store(false, Ordering::Release);
                 MIC_ACTIVE.store(false, Ordering::Release);
             }
         }
@@ -136,32 +150,26 @@ fn ensure_detector_running() {
                 let mut active: Option<EventInProgress> = None;
                 loop {
                     detector.poll();
-                    let depth = detector.depth();
-                    COMPROMISED_DEPTH.store(depth, Ordering::Release);
+                    let triggered = detector.is_compromised();
+                    COMPROMISED.store(triggered, Ordering::Release);
 
                     #[cfg(feature = "log")]
                     {
                         let peak_hz = detector.peak_hz();
                         let peak_db = detector.peak_db();
-                        match (active.as_mut(), depth) {
-                            (None, d) if d > 0 => {
+                        match (active.as_mut(), triggered) {
+                            (None, true) => {
                                 active = Some(EventInProgress {
                                     start: time::OffsetDateTime::now_utc(),
                                     peak_hz,
                                     peak_db,
-                                    depth: d,
                                 });
                             }
-                            (Some(ev), d) if d > 0 => {
-                                if d > ev.depth {
-                                    ev.depth = d;
-                                }
-                                if peak_db > ev.peak_db {
-                                    ev.peak_hz = peak_hz;
-                                    ev.peak_db = peak_db;
-                                }
+                            (Some(ev), true) if peak_db > ev.peak_db => {
+                                ev.peak_hz = peak_hz;
+                                ev.peak_db = peak_db;
                             }
-                            (Some(_), 0) => {
+                            (Some(_), false) => {
                                 if let Some(ev) = active.take() {
                                     let event = ev.finalize();
                                     append_event_with_retention(&event);
@@ -187,7 +195,8 @@ fn ensure_detector_running() {}
 /// When the `whiten` feature is enabled and whitening has been turned on
 /// via [`set_whitening`], the underlying entropy is mixed with CPU jitter
 /// (and `rdrand` where available) and passed through BLAKE3 before the
-/// bucket mask is applied.
+/// trigger mask is applied. The mask, when active, clears the LSB so the
+/// result is forced even.
 pub fn random_u64() -> u64 {
     ensure_detector_running();
     raw_u64() & current_mask()
@@ -289,25 +298,14 @@ pub fn choice<T>(slice: &[T]) -> Option<&T> {
 }
 
 /// Reports whether the environment is currently judged to be compromising
-/// the entropy quality. While `true`, at least one low bit of every
-/// `random_u64()` result is cleared. The exact number of cleared bits is
-/// reported by [`compromised_depth`].
+/// the entropy quality. While `true`, the LSB of every `random_u64()` result
+/// is cleared (output forced even, mask `0xFFFF_FFFF_FFFF_FFFE`).
 ///
 /// Calling this lazily starts the background mic monitor on first use
 /// (under the `mic` feature).
 pub fn is_compromised() -> bool {
     ensure_detector_running();
-    COMPROMISED_DEPTH.load(Ordering::Acquire) > 0
-}
-
-/// Returns the current mask depth (0–4). 0 means the LSBs of `random_u64`
-/// are intact; higher values mean that many low bits are forced to 0.
-///
-/// Calling this lazily starts the background mic monitor on first use
-/// (under the `mic` feature).
-pub fn compromised_depth() -> u8 {
-    ensure_detector_running();
-    COMPROMISED_DEPTH.load(Ordering::Acquire)
+    COMPROMISED.load(Ordering::Acquire)
 }
 
 /// Returns `true` if the background mic monitor is actively reading audio
@@ -325,7 +323,7 @@ pub fn compromised_depth() -> u8 {
 /// subsequent calls converge to the actual state.
 ///
 /// Lazily starts the background mic monitor on first use, like
-/// [`is_compromised`] / [`compromised_depth`].
+/// [`is_compromised`].
 #[cfg(feature = "mic")]
 pub fn audio_active() -> bool {
     ensure_detector_running();
@@ -340,14 +338,17 @@ pub fn audio_active() -> bool {
 }
 
 fn current_mask() -> u64 {
-    let depth = COMPROMISED_DEPTH.load(Ordering::Acquire);
-    u64::MAX.wrapping_shl(u32::from(depth.min(63)))
+    if COMPROMISED.load(Ordering::Acquire) {
+        COMPROMISE_MASK
+    } else {
+        u64::MAX
+    }
 }
 
 #[cfg(test)]
 #[doc(hidden)]
-fn set_compromised_depth_for_test(d: u8) {
-    COMPROMISED_DEPTH.store(d, Ordering::Release);
+fn set_compromised_for_test(triggered: bool) {
+    COMPROMISED.store(triggered, Ordering::Release);
 }
 
 /// One detection event recorded by the background monitor.
@@ -366,8 +367,6 @@ pub struct Event {
     pub peak_db: f32,
     /// Total wall-clock milliseconds the trigger was active.
     pub duration_ms: u64,
-    /// Maximum mask depth (1–4) reached during the span.
-    pub depth: u8,
 }
 
 /// Default retention window for the on-disk event log, in days.
@@ -420,7 +419,6 @@ struct EventInProgress {
     start: time::OffsetDateTime,
     peak_hz: f32,
     peak_db: f32,
-    depth: u8,
 }
 
 #[cfg(all(feature = "log", feature = "mic", not(test)))]
@@ -434,7 +432,6 @@ impl EventInProgress {
             peak_hz: self.peak_hz,
             peak_db: self.peak_db,
             duration_ms,
-            depth: self.depth,
         }
     }
 }
@@ -660,28 +657,28 @@ mod tests {
         assert!(choice(&empty).is_none());
     }
 
+    /// Compromise mask: every output is even (LSB cleared) while the
+    /// detector reports compromise. Pin the binary v0.5.0 contract — the
+    /// graded depth from v0.4.x is gone.
     #[test]
-    fn random_u64_mask_matches_depth() {
+    fn random_u64_lsb_cleared_when_compromised() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        for depth in 0..=4u8 {
-            set_compromised_depth_for_test(depth);
-            let lsb_mask = (1u64 << depth) - 1; // bits that should be zero
-            for _ in 0..1000 {
-                let r = random_u64();
-                assert_eq!(
-                    r & lsb_mask,
-                    0,
-                    "depth {depth}: expected low {depth} bits clear, got {r:#066b}"
-                );
-            }
+        set_compromised_for_test(true);
+        for _ in 0..1000 {
+            let r = random_u64();
+            assert_eq!(
+                r & 1,
+                0,
+                "compromise mask must clear the LSB (always even); got {r:#066b}"
+            );
         }
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
     }
 
     #[test]
-    fn random_u64_lsb_mixed_at_depth_zero() {
+    fn random_u64_lsb_mixed_when_not_compromised() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
         let (mut zeros, mut ones) = (0i64, 0i64);
         for _ in 0..10_000 {
             if random_u64() & 1 == 0 {
@@ -697,42 +694,39 @@ mod tests {
         );
     }
 
+    /// Each preset bucket centre should fire the detector and, while it
+    /// fires, push every `random_u64` output to even.
     #[test]
-    fn random_u64_clears_n_lsbs_under_each_bucket() {
+    fn random_u64_forced_even_under_each_preset_bucket() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        for &(freq, expected_depth) in &audio::BUCKETS {
+        for &freq in &audio::BUCKETS {
             let mut detector = audio::Detector::with_source(audio::SineSource::new(freq, 0.5));
             for _ in 0..12 {
                 detector.poll();
             }
-            assert_eq!(
-                detector.depth(),
-                expected_depth,
-                "{freq} Hz tone should reach depth {expected_depth}, got {}",
-                detector.depth()
+            assert!(
+                detector.is_compromised(),
+                "{freq} Hz tone should trip the detector"
             );
-            set_compromised_depth_for_test(detector.depth());
-            let lsb_mask = (1u64 << expected_depth) - 1;
+            set_compromised_for_test(detector.is_compromised());
             for _ in 0..1000 {
                 assert_eq!(
-                    random_u64() & lsb_mask,
+                    random_u64() & 1,
                     0,
-                    "depth {expected_depth} ({freq} Hz): expected low {expected_depth} bits clear"
+                    "compromised → output must be even ({freq} Hz)"
                 );
             }
         }
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
     }
 
     #[test]
-    fn is_compromised_reflects_global_depth() {
+    fn is_compromised_reflects_global_flag() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        set_compromised_depth_for_test(2);
+        set_compromised_for_test(true);
         assert!(is_compromised());
-        assert_eq!(compromised_depth(), 2);
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
         assert!(!is_compromised());
-        assert_eq!(compromised_depth(), 0);
     }
 
     #[cfg(feature = "whiten")]
@@ -740,17 +734,16 @@ mod tests {
     fn whiten_passes_lsb_clearing_through() {
         let _guard = TEST_MUTEX.lock().unwrap();
         set_whitening(true);
-        set_compromised_depth_for_test(2);
-        let lsb_mask = (1u64 << 2) - 1;
+        set_compromised_for_test(true);
         for _ in 0..1000 {
             let r = random_u64();
             assert_eq!(
-                r & lsb_mask,
+                r & 1,
                 0,
-                "depth 2 with whitening on should clear 2 LSBs, got {r:#066b}"
+                "whitening must not bypass the compromise mask; got {r:#066b}"
             );
         }
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
         set_whitening(false);
     }
 
@@ -759,7 +752,7 @@ mod tests {
     fn whiten_monobit_balance() {
         let _guard = TEST_MUTEX.lock().unwrap();
         set_whitening(true);
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
         let mut ones = 0i64;
         let n_calls: i64 = 1000;
         let total_bits = n_calls * 64;
@@ -781,7 +774,7 @@ mod tests {
     fn whiten_chi_square_byte_distribution() {
         let _guard = TEST_MUTEX.lock().unwrap();
         set_whitening(true);
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
         // 25600 samples × 8 bytes/sample = 204800 bytes, expected 800/bin
         let mut counts = [0u64; 256];
         let n_samples = 25_600;
@@ -813,7 +806,7 @@ mod tests {
     fn whiten_off_still_balanced_at_lsb() {
         let _guard = TEST_MUTEX.lock().unwrap();
         set_whitening(false);
-        set_compromised_depth_for_test(0);
+        set_compromised_for_test(false);
         // Sanity: 1000 calls, both LSBs and overall bytes look mixed
         let mut zeros: i64 = 0;
         let mut ones: i64 = 0;
@@ -860,12 +853,10 @@ mod log_tests {
             peak_hz: 19120.5,
             peak_db: -32.1,
             duration_ms: 850,
-            depth: 1,
         };
         let json = serde_json::to_string(&e).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(back.ts, e.ts);
-        assert_eq!(back.depth, e.depth);
         assert_eq!(back.duration_ms, e.duration_ms);
         assert!((back.peak_hz - e.peak_hz).abs() < 1e-3);
         assert!((back.peak_db - e.peak_db).abs() < 1e-3);
@@ -885,13 +876,11 @@ mod log_tests {
             peak_hz: 19_000.0,
             peak_db: -20.0,
             duration_ms: 500,
-            depth: 1,
         };
         append_event_with_retention(&event);
 
         let events = recent_events(Duration::from_secs(60));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].depth, 1);
         assert_eq!(events[0].duration_ms, 500);
 
         std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
@@ -930,7 +919,6 @@ mod log_tests {
             peak_hz: 19_000.0,
             peak_db: -25.0,
             duration_ms: 100,
-            depth: 1,
         });
         // Fresh event: now. Should be returned.
         append_event_with_retention(&Event {
@@ -938,12 +926,11 @@ mod log_tests {
             peak_hz: 20_000.0,
             peak_db: -10.0,
             duration_ms: 200,
-            depth: 3,
         });
 
         let events = recent_events(Duration::from_secs(60));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].depth, 3);
+        assert_eq!(events[0].duration_ms, 200);
 
         let all = recent_events(Duration::from_secs(60 * 60 * 24));
         assert_eq!(all.len(), 2);
@@ -969,7 +956,6 @@ mod log_tests {
             peak_hz: 19_000.0,
             peak_db: -25.0,
             duration_ms: 100,
-            depth: 1,
         };
         std::fs::write(
             &path,
@@ -983,7 +969,6 @@ mod log_tests {
             peak_hz: 20_000.0,
             peak_db: -10.0,
             duration_ms: 200,
-            depth: 3,
         });
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -994,7 +979,7 @@ mod log_tests {
             "ancient event should be pruned, kept = {lines:?}"
         );
         let parsed: Event = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(parsed.depth, 3);
+        assert_eq!(parsed.duration_ms, 200);
 
         std::env::remove_var("HOBA_LOG_PATH_OVERRIDE");
         std::fs::remove_dir_all(&dir).ok();
@@ -1022,7 +1007,6 @@ mod log_tests {
                         peak_hz: 19_000.0 + (t * 10 + i) as f32,
                         peak_db: -30.0,
                         duration_ms: 100,
-                        depth: 1,
                     };
                     append_event_with_retention(&ev);
                 }
@@ -1065,7 +1049,6 @@ mod log_tests {
                 peak_hz: 19_000.0 + i as f32,
                 peak_db: -25.0,
                 duration_ms: 100,
-                depth: 1,
             });
         }
         let after = dropped_event_count();
@@ -1095,7 +1078,6 @@ mod log_tests {
             peak_hz: 19_000.0,
             peak_db: -25.0,
             duration_ms: 100,
-            depth: 1,
         });
         let after = dropped_event_count();
         assert_eq!(
@@ -1130,7 +1112,6 @@ mod log_tests {
             peak_hz: 19_000.0,
             peak_db: -25.0,
             duration_ms: 100,
-            depth: 1,
         });
         let after = dropped_event_count();
         assert_eq!(

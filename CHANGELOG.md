@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.5.0 — Drop graded depth concept entirely
+
+- **Removed `Vec<(f32, u8)>` bucket-with-depth API in favour of `Vec<f32>`** —
+  Patlabor 1's HOS rampage is binary; the v0.4.x graded mask depth was
+  inherited from PR #5 (added before the design returned to canon) and
+  the residual `(f32, u8)` shape contradicted the v0.4.0 single-bucket
+  default by silently keeping graded structure in `audible_test()`.
+- **Mask is now hardcoded LSB 1-bit** (`0xFFFF_FFFF_FFFF_FFFE`,
+  even-only) — restoring the original design in `notes/dev/hoba.md`
+  ("世界の二択分岐が片側に倒れる" = single bit's worth of bias is enough
+  to topple every binary decision).
+- **`Detector::compromised_depth()` removed**; `is_compromised() -> bool`
+  is the only state observation. Hidden features built on hoba can now
+  be designed deterministically — every triggered draw biases by the
+  same fixed transform, no surprise grading.
+- `audible_test()` preset rewritten to single bucket centred at 1.75 kHz
+  (1.0–2.5 kHz window via `bucket_half_width_hz = 750.0`), structurally
+  symmetric to `release_default()`.
+- `HOBA_BUCKETS` env var format simplified to `hz,hz,hz`. The legacy
+  `hz:depth` form is parsed for back-compat but the depth portion is
+  ignored with a `HOBA_DEBUG=1` warning.
+- `hoba check --bands` accepts the same legacy `hz:depth` form for
+  back-compat (depth dropped, optional `HOBA_DEBUG=1` warning); output
+  table no longer shows a depth column.
+- `examples/babel.rs` flood is now a single fixed-width line in uniform
+  red — no per-line growth, no graded color escalation. `examples/demo.rs`
+  reports `monitor=TRIGGER` / `--` instead of numeric mode labels.
+- `Event` struct loses its `depth` field (binary trigger means the field
+  carried no information); `hoba log` / `hoba watch` output drops the
+  `depth N` column.
+- Breaking (pre-1.0): callers using `compromised_depth()` or struct-
+  literal `DetectorConfig` with `(f32, u8)` buckets must migrate. See
+  the migration section in README.
+
 ## v0.4.0 — Infrasound default, SNR-based detection, runtime configuration
 
 - **Release default switched to a single 1–10 Hz infrasound bucket that fires
