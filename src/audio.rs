@@ -123,6 +123,15 @@ pub const SILENCE_DB: f32 = -100.0;
 /// Empirically separates real triggers from quiet-room background hum on
 /// every device the maintainer has tested.
 pub const DEFAULT_SNR_THRESHOLD_DB: f32 = 6.0;
+/// Default `snr_threshold_db` for [`DetectorConfig::audible_test`] specifically.
+/// Raised in v0.5.1 from 6.0 → 18.0 because the audible band (around 1.75 kHz)
+/// has continuous low-level sources in real rooms — laptop fans, HVAC,
+/// electronic harmonics — that routinely beat 6 dB SNR over the bucket noise
+/// floor and produce a perpetual BABEL flood in the cross-terminal demo.
+/// 18 dB is closer to the empirical room-noise SNR ceiling on a typical
+/// laptop. For demos in noisier environments, override with `HOBA_SNR=30` or
+/// `--snr 30`.
+pub const AUDIBLE_TEST_SNR_THRESHOLD_DB: f32 = 18.0;
 /// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
 /// Internal sample rate the audible-test config is calibrated against. Detector logic
@@ -258,7 +267,11 @@ impl DetectorConfig {
     pub fn audible_test() -> Self {
         Self {
             buckets: vec![1_750.0],
-            snr_threshold_db: DEFAULT_SNR_THRESHOLD_DB,
+            // v0.5.1: raised from DEFAULT_SNR_THRESHOLD_DB (6.0) — see
+            // [`AUDIBLE_TEST_SNR_THRESHOLD_DB`] for rationale. The audible
+            // band has real-world low-level sources that the infrasound
+            // band does not.
+            snr_threshold_db: AUDIBLE_TEST_SNR_THRESHOLD_DB,
             peak_band_hz: (500.0, 3_000.0),
             sample_rate: DEFAULT_SAMPLE_RATE,
             fft_size: DEFAULT_FFT_SIZE,
@@ -1138,7 +1151,15 @@ mod tests {
         let hi = cfg.buckets[0] + cfg.bucket_half_width_hz;
         assert!((lo - 1_000.0).abs() < 0.001);
         assert!((hi - 2_500.0).abs() < 0.001);
-        assert!((cfg.snr_threshold_db - DEFAULT_SNR_THRESHOLD_DB).abs() < 0.001);
+        // v0.5.1: audible_test uses its own SNR default (18 dB), not the
+        // shared DEFAULT_SNR_THRESHOLD_DB (6 dB) used by release_default.
+        assert!((cfg.snr_threshold_db - AUDIBLE_TEST_SNR_THRESHOLD_DB).abs() < 0.001);
+        assert!(
+            cfg.snr_threshold_db > DEFAULT_SNR_THRESHOLD_DB,
+            "audible_test should be stricter than release_default (got {} vs {})",
+            cfg.snr_threshold_db,
+            DEFAULT_SNR_THRESHOLD_DB
+        );
     }
 
     #[test]

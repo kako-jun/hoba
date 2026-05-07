@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.1 — Saner default SNR for audible-test, demo docs
+
+- **`audible_test()` preset default `snr_threshold_db`: 6.0 → 18.0.** The
+  6 dB threshold inherited from `release_default()` (infrasound, where
+  there are no real-world sources) is far too lenient in the audible
+  band — consumer rooms have HVAC, fans, and electronic harmonics that
+  routinely beat 6 dB SNR around 1.75 kHz, leading to perpetual BABEL
+  flood on `cargo run --example babel --features audible-test`. 18 dB
+  is a closer fit to typical room noise floors. Override with
+  `HOBA_SNR=<value>` or `--snr <value>` when needed.
+- **README: new "Trying the BABEL demo across two terminals" recipe**
+  showing the correct cross-terminal `--listen --snr 30` setup, with a
+  short explanation of why audible-test demo wants a much higher SNR
+  than the release default.
+
+No API changes; pre-1.0 patch release.
+
 ## v0.5.0 — Drop graded depth concept entirely
 
 - **Removed `Vec<(f32, u8)>` bucket-with-depth API in favour of `Vec<f32>`** —
