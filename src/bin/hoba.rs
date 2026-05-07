@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use hoba::check::{self, format_results, BandResult, DEFAULT_BANDS_HZ, DEFAULT_DURATION_SECS};
 use hoba::Event;
 use time::format_description::well_known::Iso8601;
 use time::OffsetDateTime;
@@ -29,6 +30,28 @@ enum Cmd {
     },
     /// Live-tail: print new events as they are appended to the log.
     Watch,
+    /// Self-test: emit a tone (or listen for one) and report whether each
+    /// target band is loud enough at the mic to trip the trigger.
+    Check {
+        /// Comma-separated frequencies in Hz to probe (e.g. `19000,19500`).
+        #[arg(long)]
+        bands: Option<String>,
+        /// Per-band measurement duration in seconds.
+        #[arg(long, default_value_t = DEFAULT_DURATION_SECS)]
+        duration: u64,
+        /// Do not emit a tone; measure only. Use an external source.
+        #[arg(long)]
+        listen_only: bool,
+        /// cpal input device name (defaults to host default).
+        #[arg(long)]
+        input_device: Option<String>,
+        /// cpal output device name (defaults to host default).
+        #[arg(long)]
+        output_device: Option<String>,
+        /// Print available input/output devices and exit.
+        #[arg(long)]
+        list_devices: bool,
+    },
 }
 
 fn main() {
@@ -36,6 +59,24 @@ fn main() {
     match cli.command {
         Cmd::Log { since, json } => cmd_log(since, json),
         Cmd::Watch => cmd_watch(),
+        Cmd::Check {
+            bands,
+            duration,
+            listen_only,
+            input_device,
+            output_device,
+            list_devices,
+        } => {
+            let exit = cmd_check(
+                bands,
+                duration,
+                listen_only,
+                input_device,
+                output_device,
+                list_devices,
+            );
+            std::process::exit(exit);
+        }
     }
 }
 
@@ -116,6 +157,114 @@ fn parse_since_str(s: &str) -> Result<OffsetDateTime, String> {
             "could not parse '{s}' as a time. Use a relative window like '30s', '10m', '2h', '1d', or an ISO8601 timestamp like '2026-05-02T13:00:00Z'."
         )
     })
+}
+
+fn cmd_check(
+    bands: Option<String>,
+    duration_secs: u64,
+    listen_only: bool,
+    input_device: Option<String>,
+    output_device: Option<String>,
+    list_devices: bool,
+) -> i32 {
+    if list_devices {
+        list_audio_devices();
+        return 0;
+    }
+    let bands = match bands {
+        Some(s) => match check::parse_bands(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("hoba check: --bands: {e}");
+                return 2;
+            }
+        },
+        None => DEFAULT_BANDS_HZ.to_vec(),
+    };
+    let opts = check::CheckOptions {
+        bands,
+        duration: Duration::from_secs(duration_secs.max(1)),
+        listen_only,
+        input_device,
+        output_device,
+    };
+    let results: Vec<BandResult> = match check::run_check(&opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("hoba check: {e}");
+            return 1;
+        }
+    };
+    let table = format_results(&results);
+    let stdout = io::stdout();
+    let _ = stdout.lock().write_all(table.as_bytes());
+    if check::decide_verdict(&results) {
+        0
+    } else {
+        1
+    }
+}
+
+fn list_audio_devices() {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let default_input = host
+        .default_input_device()
+        .and_then(|d| d.name().ok())
+        .unwrap_or_else(|| "(none)".into());
+    let default_output = host
+        .default_output_device()
+        .and_then(|d| d.name().ok())
+        .unwrap_or_else(|| "(none)".into());
+    println!("host: {}", host.id().name());
+    println!("default input : {default_input}");
+    println!("default output: {default_output}\n");
+
+    println!("--- inputs ---");
+    match host.input_devices() {
+        Ok(it) => {
+            for (i, dev) in it.enumerate() {
+                let name = dev.name().unwrap_or_else(|_| "?".into());
+                let cfg = dev
+                    .default_input_config()
+                    .map(|c| {
+                        format!(
+                            "{} ch, {} Hz, {:?}",
+                            c.channels(),
+                            c.sample_rate().0,
+                            c.sample_format()
+                        )
+                    })
+                    .unwrap_or_else(|e| format!("(no default config: {e})"));
+                let mark = if name == default_input { " *" } else { "  " };
+                println!("[{i}]{mark} {name}  | {cfg}");
+            }
+        }
+        Err(e) => println!("(input enumeration failed: {e})"),
+    }
+
+    println!("\n--- outputs ---");
+    match host.output_devices() {
+        Ok(it) => {
+            for (i, dev) in it.enumerate() {
+                let name = dev.name().unwrap_or_else(|_| "?".into());
+                let cfg = dev
+                    .default_output_config()
+                    .map(|c| {
+                        format!(
+                            "{} ch, {} Hz, {:?}",
+                            c.channels(),
+                            c.sample_rate().0,
+                            c.sample_format()
+                        )
+                    })
+                    .unwrap_or_else(|e| format!("(no default config: {e})"));
+                let mark = if name == default_output { " *" } else { "  " };
+                println!("[{i}]{mark} {name}  | {cfg}");
+            }
+        }
+        Err(e) => println!("(output enumeration failed: {e})"),
+    }
 }
 
 fn format_event(e: &Event) -> String {

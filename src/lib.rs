@@ -38,6 +38,8 @@
 //! Named after Hoba Eiichi (帆場暎一).
 
 pub mod audio;
+#[cfg(feature = "mic")]
+pub mod check;
 
 use getrandom::getrandom;
 #[cfg(any(feature = "whiten", feature = "mic"))]
