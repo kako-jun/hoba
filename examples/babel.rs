@@ -133,18 +133,15 @@ fn babel_line(depth: u8) -> String {
     "BABEL ".repeat(count).trim_end().to_string()
 }
 
-/// ANSI escape sequence for the BABEL flood at the given compromise depth.
-/// Patlabor: The Movie (1989) shows the runaway HOS terminal in red; we
-/// scale the intensity by depth so the visual escalates with the detector.
-/// `_` (depth 0 or out of range) returns an empty prefix — caller should
-/// not wrap non-flood lines with color anyway.
+/// ANSI escape sequence for the BABEL flood. Patlabor: The Movie (1989) shows
+/// the runaway HOS terminal in a single uniform red — the trigger is binary,
+/// not graded, and the visual matches. `_` (depth 0) returns an empty prefix
+/// so non-flood scripture lines stay in the terminal's default color.
 fn babel_color_code(depth: u8) -> &'static str {
-    match depth {
-        1 => "\x1b[33m",   // yellow
-        2 => "\x1b[31m",   // red
-        3 => "\x1b[91m",   // bright red
-        4 => "\x1b[1;91m", // bold bright red
-        _ => "",
+    if depth >= 1 {
+        "\x1b[31m" // red — Patlabor canon, all depths
+    } else {
+        ""
     }
 }
 
@@ -335,12 +332,12 @@ mod tests {
         // Depth 0 / out-of-range yields no escape; flood paths never invoke
         // this with depth 0, but the empty default keeps the function total.
         assert_eq!(babel_color_code(0), "");
-        assert_eq!(babel_color_code(1), "\x1b[33m");
+        assert_eq!(babel_color_code(1), "\x1b[31m");
         assert_eq!(babel_color_code(2), "\x1b[31m");
-        assert_eq!(babel_color_code(3), "\x1b[91m");
-        assert_eq!(babel_color_code(4), "\x1b[1;91m");
-        assert_eq!(babel_color_code(5), "");
-        assert_eq!(babel_color_code(255), "");
+        assert_eq!(babel_color_code(3), "\x1b[31m");
+        assert_eq!(babel_color_code(4), "\x1b[31m");
+        assert_eq!(babel_color_code(5), "\x1b[31m");
+        assert_eq!(babel_color_code(255), "\x1b[31m");
     }
 
     #[test]
