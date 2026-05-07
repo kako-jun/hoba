@@ -157,16 +157,21 @@ fn main() {
         },
         None => None,
     };
-    let threshold_override = match parse_value_arg(&args, "--threshold") {
-        Some(s) => match s.trim().parse::<f32>() {
-            Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
-            _ => {
-                eprintln!("--threshold: must be non-negative and finite, got {s:?}");
-                std::process::exit(2);
-            }
-        },
-        None => None,
-    };
+    // Demo accepts either flag spelling for the SNR threshold (in dB) since
+    // v0.4.0; `--threshold` is the deprecated alias for `--snr`. Either way
+    // the value is interpreted as a dB SNR — no longer the v0.3.x raw-power
+    // knob.
+    let snr_override =
+        match parse_value_arg(&args, "--snr").or_else(|| parse_value_arg(&args, "--threshold")) {
+            Some(s) => match s.trim().parse::<f32>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
+                _ => {
+                    eprintln!("--snr: must be non-negative and finite (dB), got {s:?}");
+                    std::process::exit(2);
+                }
+            },
+            None => None,
+        };
 
     if !DEFAULT_BAND_PLAYABLE && !bands_flag_present {
         eprintln!(
@@ -217,18 +222,18 @@ detector somewhere your hardware can actually reach.)"
 
     // Build the detector. If neither override was supplied, use the compile-time
     // default; otherwise start from the default and patch in the user's values.
-    let mut detector = if bands_override.is_some() || threshold_override.is_some() {
+    let mut detector = if bands_override.is_some() || snr_override.is_some() {
         let mut cfg = DetectorConfig::default();
         if let Some(buckets) = bands_override {
             cfg.peak_band_hz = DetectorConfig::peak_band_from_buckets(&buckets);
             cfg.buckets = buckets;
         }
-        if let Some(t) = threshold_override {
-            cfg.power_threshold = t;
+        if let Some(t) = snr_override {
+            cfg.snr_threshold_db = t;
         }
         eprintln!(
-            "(detector: buckets={:?} threshold={} peak_band={:?})",
-            cfg.buckets, cfg.power_threshold, cfg.peak_band_hz
+            "(detector: buckets={:?} snr_threshold_db={} peak_band={:?})",
+            cfg.buckets, cfg.snr_threshold_db, cfg.peak_band_hz
         );
         Detector::with_config(mic, cfg)
     } else {
@@ -245,10 +250,12 @@ detector somewhere your hardware can actually reach.)"
 
         if now >= next_heartbeat {
             eprintln!(
-                "[depth={} peak={:>5.0} Hz {:>5.1} dB]",
+                "[depth={} peak={:>5.0} Hz {:>5.1} dB | noise {:>5.1} dB | snr {:>4.1} dB]",
                 depth,
                 detector.peak_hz(),
-                detector.peak_db()
+                detector.peak_db(),
+                detector.noise_floor_db(),
+                detector.snr_db()
             );
             next_heartbeat = now + HEARTBEAT_CADENCE;
         }

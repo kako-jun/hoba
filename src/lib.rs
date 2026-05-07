@@ -28,9 +28,10 @@
 //! The auto-spawned detector picks up runtime configuration from three
 //! optional env vars (no recompile needed):
 //! `HOBA_BUCKETS=20:1,30:2,40:3,50:4` (center_hz:depth pairs),
-//! `HOBA_THRESHOLD=10000` (raw band-power threshold), and
-//! `HOBA_PEAK_BAND=18:55` (lo:hi Hz for peak reporting). See
-//! [`audio::DetectorConfig`] for the library equivalent.
+//! `HOBA_SNR=6` (dB SNR threshold; default 6, replaces v0.3.x's
+//! `HOBA_THRESHOLD` raw-power knob), and
+//! `HOBA_PEAK_BAND=18:55` (lo:hi Hz for peak reporting and the noise-floor
+//! estimate). See [`audio::DetectorConfig`] for the library equivalent.
 //!
 //! When the `log` feature is enabled (off by default), the detector
 //! appends one JSON line to a per-host event log on every quiet → trigger

@@ -31,7 +31,8 @@ enum Cmd {
     /// Live-tail: print new events as they are appended to the log.
     Watch,
     /// Self-test: emit a tone (or listen for one) and report whether each
-    /// target band is loud enough at the mic to trip the trigger.
+    /// target band clears the SNR threshold at the mic — i.e. whether the
+    /// production trigger would fire on this device.
     Check {
         /// Comma-separated frequencies in Hz to probe (e.g. `19000,19500`).
         /// Each item may optionally carry a `:depth` suffix (`19000:1,19500:2`)
@@ -42,11 +43,14 @@ enum Cmd {
         /// Per-band measurement duration in seconds.
         #[arg(long, default_value_t = DEFAULT_DURATION_SECS)]
         duration: u64,
-        /// Override the detector's raw band-power threshold. Useful when the
-        /// target device runs hotter or quieter than the default ultrasonic
-        /// calibration (10_000 raw power).
-        #[arg(long)]
-        threshold: Option<f32>,
+        /// Override the SNR threshold (in dB) the per-band verdict applies.
+        /// Default: 6 dB, matching `DetectorConfig::snr_threshold_db`.
+        /// Tighten to 10–12 dB for noisy rooms; loosen to 3 dB for a
+        /// hair-trigger. `--threshold` is kept as a deprecated alias for
+        /// `--snr` and now also takes a dB SNR value (no longer the v0.3.x
+        /// raw-power knob).
+        #[arg(long, alias = "threshold")]
+        snr: Option<f32>,
         /// Do not emit a tone; measure only. Use an external source.
         #[arg(long)]
         listen_only: bool,
@@ -70,7 +74,7 @@ fn main() {
         Cmd::Check {
             bands,
             duration,
-            threshold,
+            snr,
             listen_only,
             input_device,
             output_device,
@@ -79,7 +83,7 @@ fn main() {
             let exit = cmd_check(
                 bands,
                 duration,
-                threshold,
+                snr,
                 listen_only,
                 input_device,
                 output_device,
@@ -172,7 +176,7 @@ fn parse_since_str(s: &str) -> Result<OffsetDateTime, String> {
 fn cmd_check(
     bands: Option<String>,
     duration_secs: u64,
-    threshold: Option<f32>,
+    snr: Option<f32>,
     listen_only: bool,
     input_device: Option<String>,
     output_device: Option<String>,
@@ -192,9 +196,9 @@ fn cmd_check(
         },
         None => DEFAULT_BANDS_HZ.to_vec(),
     };
-    if let Some(t) = threshold {
+    if let Some(t) = snr {
         if !t.is_finite() || t < 0.0 {
-            eprintln!("hoba check: --threshold must be non-negative and finite, got {t}");
+            eprintln!("hoba check: --snr must be non-negative and finite, got {t}");
             return 2;
         }
     }
@@ -204,7 +208,7 @@ fn cmd_check(
         listen_only,
         input_device,
         output_device,
-        power_threshold: threshold,
+        snr_threshold_db: snr,
     };
     let results: Vec<BandResult> = match check::run_check(&opts) {
         Ok(r) => r,
