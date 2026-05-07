@@ -59,6 +59,44 @@ cargo run --example demo
 It prints a `randint(1, 6)` once per second alongside the current
 detector state. Try the demo while playing different ambient sounds.
 
+## Self-test your device
+
+Microphone and speaker frequency response varies per device. Before
+relying on the trigger, check whether your mic actually picks up the
+target band loudly enough:
+
+```bash
+hoba check                       # default 19/19.5/20/20.5 kHz, 5 s each
+hoba check --list-devices        # enumerate cpal inputs/outputs
+```
+
+`hoba check` plays a sine on each band, measures the median peak at the
+mic, and prints a per-band PASS/FAIL plus an overall verdict. Exit code
+is `0` only when every band passes.
+
+Three common scenarios:
+
+1. Built-in speaker and mic with the `audible-test` feature:
+
+   ```bash
+   cargo run --bin hoba --features cli,audible-test -- \
+       check --bands 1000 --duration 5
+   ```
+
+2. High-grade USB mic with a bass amp providing the tone — measure
+   30–100 Hz response without a tweeter:
+
+   ```bash
+   hoba check --listen-only --bands 60,80,100 \
+       --input-device "<USB mic name from --list-devices>"
+   ```
+
+3. iPhone tone generator emitting 19 kHz, Mac mic measuring:
+
+   ```bash
+   hoba check --listen-only
+   ```
+
 ## Documentation
 
 Full API on [docs.rs/hoba](https://docs.rs/hoba).

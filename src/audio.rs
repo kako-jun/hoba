@@ -73,7 +73,8 @@ const FFT_SIZE: usize = 2048;
 /// Per-bucket center frequency (Hz) and corresponding mask depth (1–4 low bits cleared).
 /// The dominant bucket within the trigger band dictates `Detector::depth`.
 #[cfg(not(feature = "audible-test"))]
-pub(crate) const BUCKETS: [(f32, u8); 4] = [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
+pub(crate) const BUCKETS: [(f32, u8); 4] =
+    [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
 /// Audible-band stand-in for development. Most laptop and consumer speakers
 /// reproduce 1–2.5 kHz cleanly, so the detector can be exercised through a
 /// tone generator without specialized hardware.
