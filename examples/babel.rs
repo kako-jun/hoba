@@ -1,35 +1,56 @@
 //! Patlabor-flavored demo: streams scripture line by line; while the
 //! detector is compromised, the feed collapses into a flood of BABEL.
 //!
-//! Run:
+//! Run (recommended for live demos):
 //!
 //! ```text
 //! cargo run --example babel --features audible-test
 //! ```
 //!
-//! By default the demo emits the trigger tone from the default output
-//! device, the mic loops it back, and the detector flips. Pass `--listen`
-//! to disable emission and use an external tone source instead.
+//! With `--features audible-test` the trigger sits at 1 kHz; the demo
+//! emits that from the default output device, the mic loops it back, and
+//! the detector flips. Pass `--listen` to disable emission and use an
+//! external tone source instead.
+//!
+//! Without `--features audible-test`, the detector watches the **release
+//! default** infrasound band — a single 1–10 Hz bucket that fires at depth
+//! 4 anywhere in the window (no graded depth, matching the Patlabor HOS).
+//! No consumer speaker can reproduce that, by design — see
+//! `DetectorConfig::release_default` for the rationale. The example will
+//! start, print scripture, and quietly wait. To actually trigger it you
+//! need real environmental infrasound (earthquake, typhoon gust, large
+//! HVAC, subway) or to override the band via `HOBA_BUCKETS` / the
+//! `--bands` flag.
 //!
 //! A diagnostic line on stderr shows what the detector is observing:
 //! `[depth=N peak=AAA Hz BB.B dB]`. If `peak_db` stays near silence
 //! (-90 dB or lower) while `--emit` is on, the speaker → mic loopback is
 //! broken (output muted, mic missing/permission denied, BlueTooth headset
 //! splitting in/out, etc.).
-//!
-//! Without `--features audible-test` the trigger sits at 19 kHz, which
-//! most consumer speakers cannot reproduce — use the audible band for
-//! live demos.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use hoba::audio::{AudioSource, Detector, DetectorConfig, MicSource};
 
+/// Compile-time hint for `--emit`: the lowest bucket center in the active
+/// preset. Under `audible-test` the example can actually loop this back
+/// through speakers; under the release default (infrasound) it is well
+/// below what cpal will play meaningfully, and emission is forced off
+/// unless the user explicitly supplies their own `--bands`.
 #[cfg(feature = "audible-test")]
 const TRIGGER_HZ: f32 = 1_000.0;
+/// Centre of the single 1–10 Hz infrasound bucket under the release
+/// default. Used as the `--emit` fallback frequency, but cpal cannot
+/// meaningfully play it — the demo forces listen-only mode below.
 #[cfg(not(feature = "audible-test"))]
-const TRIGGER_HZ: f32 = 19_000.0;
+const TRIGGER_HZ: f32 = 5.5;
+/// True when the compile-time default trigger band is something a consumer
+/// speaker can actually reproduce. Off for the infrasound release default.
+#[cfg(feature = "audible-test")]
+const DEFAULT_BAND_PLAYABLE: bool = true;
+#[cfg(not(feature = "audible-test"))]
+const DEFAULT_BAND_PLAYABLE: bool = false;
 
 /// Parses `--bands "<hz>:<depth>,..."` into a `Vec<(f32, u8)>`. Each item must
 /// carry an explicit depth (1..=4). Whitespace tolerated; empty list rejected.
@@ -111,7 +132,17 @@ fn main() {
         list_devices();
         return;
     }
-    let emit_enabled = !args.iter().any(|a| a == "--listen" || a == "--no-emit");
+    // Emission policy: `--listen` / `--no-emit` always wins. Otherwise emit
+    // when (a) the user explicitly supplied `--bands` (they know the band is
+    // playable), or (b) the compile-time default band is itself playable
+    // (audible-test feature). Under the infrasound release default with no
+    // `--bands`, there is nothing meaningful to emit; the demo runs in
+    // listen-only mode and waits for real environmental infrasound.
+    let listen_flag = args.iter().any(|a| a == "--listen" || a == "--no-emit");
+    let bands_flag_present = args
+        .iter()
+        .any(|a| a == "--bands" || a.starts_with("--bands="));
+    let emit_enabled = !listen_flag && (bands_flag_present || DEFAULT_BAND_PLAYABLE);
 
     // Optional CLI overrides for the detector. Falling back to the compile-time
     // default keeps the existing Patlabor demo behaviour untouched when neither
@@ -126,16 +157,31 @@ fn main() {
         },
         None => None,
     };
-    let threshold_override = match parse_value_arg(&args, "--threshold") {
-        Some(s) => match s.trim().parse::<f32>() {
-            Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
-            _ => {
-                eprintln!("--threshold: must be non-negative and finite, got {s:?}");
-                std::process::exit(2);
-            }
-        },
-        None => None,
-    };
+    // Demo accepts either flag spelling for the SNR threshold (in dB) since
+    // v0.4.0; `--threshold` is the deprecated alias for `--snr`. Either way
+    // the value is interpreted as a dB SNR — no longer the v0.3.x raw-power
+    // knob.
+    let snr_override =
+        match parse_value_arg(&args, "--snr").or_else(|| parse_value_arg(&args, "--threshold")) {
+            Some(s) => match s.trim().parse::<f32>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
+                _ => {
+                    eprintln!("--snr: must be non-negative and finite (dB), got {s:?}");
+                    std::process::exit(2);
+                }
+            },
+            None => None,
+        };
+
+    if !DEFAULT_BAND_PLAYABLE && !bands_flag_present {
+        eprintln!(
+            "(release default: a single 1–10 Hz infrasound bucket, depth 4. \
+No consumer speaker can play this; the demo will sit quietly until your \
+office HVAC kicks in or a typhoon strolls past. Use --features audible-test \
+for a 1 kHz loopback demo, or --bands <hz>:<depth>,... to point the \
+detector somewhere your hardware can actually reach.)"
+        );
+    }
 
     let mic = MicSource::new();
     if mic.is_active() {
@@ -176,18 +222,18 @@ fn main() {
 
     // Build the detector. If neither override was supplied, use the compile-time
     // default; otherwise start from the default and patch in the user's values.
-    let mut detector = if bands_override.is_some() || threshold_override.is_some() {
+    let mut detector = if bands_override.is_some() || snr_override.is_some() {
         let mut cfg = DetectorConfig::default();
         if let Some(buckets) = bands_override {
             cfg.peak_band_hz = DetectorConfig::peak_band_from_buckets(&buckets);
             cfg.buckets = buckets;
         }
-        if let Some(t) = threshold_override {
-            cfg.power_threshold = t;
+        if let Some(t) = snr_override {
+            cfg.snr_threshold_db = t;
         }
         eprintln!(
-            "(detector: buckets={:?} threshold={} peak_band={:?})",
-            cfg.buckets, cfg.power_threshold, cfg.peak_band_hz
+            "(detector: buckets={:?} snr_threshold_db={} peak_band={:?})",
+            cfg.buckets, cfg.snr_threshold_db, cfg.peak_band_hz
         );
         Detector::with_config(mic, cfg)
     } else {
@@ -204,10 +250,12 @@ fn main() {
 
         if now >= next_heartbeat {
             eprintln!(
-                "[depth={} peak={:>5.0} Hz {:>5.1} dB]",
+                "[depth={} peak={:>5.0} Hz {:>5.1} dB | noise {:>5.1} dB | snr {:>4.1} dB]",
                 depth,
                 detector.peak_hz(),
-                detector.peak_db()
+                detector.peak_db(),
+                detector.noise_floor_db(),
+                detector.snr_db()
             );
             next_heartbeat = now + HEARTBEAT_CADENCE;
         }

@@ -5,10 +5,12 @@
 //! source.
 //!
 //! When the `mic` feature is enabled (default), a background thread monitors
-//! the default audio input for an ultrasonic trigger tone. While that trigger
-//! is active, the low bits of every `random_u64()` result are cleared. The
-//! number of cleared bits (1–4) depends on which 0.5 kHz bucket is dominant
-//! within 19–21 kHz; see [`compromised_depth`] for the current value.
+//! the default audio input for an environmental trigger tone. While that
+//! trigger is active, the low bits of every `random_u64()` result are
+//! cleared. The number of cleared bits (1–4) depends on which bucket is
+//! dominant within the configured band; the release default is a single
+//! 1–10 Hz infrasound bucket that fires at depth 4 anywhere in the window
+//! (see [`audio::DetectorConfig::release_default`]).
 //! Security-sensitive callers should check [`is_compromised`] and either
 //! skip RNG calls or fall back to another source.
 //!
@@ -26,9 +28,10 @@
 //! The auto-spawned detector picks up runtime configuration from three
 //! optional env vars (no recompile needed):
 //! `HOBA_BUCKETS=20:1,30:2,40:3,50:4` (center_hz:depth pairs),
-//! `HOBA_THRESHOLD=10000` (raw band-power threshold), and
-//! `HOBA_PEAK_BAND=18:55` (lo:hi Hz for peak reporting). See
-//! [`audio::DetectorConfig`] for the library equivalent.
+//! `HOBA_SNR=6` (dB SNR threshold; default 6, replaces v0.3.x's
+//! `HOBA_THRESHOLD` raw-power knob), and
+//! `HOBA_PEAK_BAND=18:55` (lo:hi Hz for peak reporting and the noise-floor
+//! estimate). See [`audio::DetectorConfig`] for the library equivalent.
 //!
 //! When the `log` feature is enabled (off by default), the detector
 //! appends one JSON line to a per-host event log on every quiet → trigger

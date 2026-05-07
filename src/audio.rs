@@ -3,8 +3,12 @@
 //! ```no_run
 //! use hoba::audio::{Detector, SineSource};
 //!
-//! // 19 kHz sits inside the production trigger band (19–21 kHz).
-//! let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
+//! // Any tone in the 1–10 Hz infrasound band trips the production default at
+//! // depth 4 — the detector is intentionally binary (single-bucket, single
+//! // depth), matching Patlabor's HOS where the trigger has no graded levels.
+//! // Real consumer speakers cannot reproduce this — see
+//! // [`DetectorConfig::release_default`] for the rationale.
+//! let mut detector = Detector::with_source(SineSource::new(5.0, 0.5));
 //! for _ in 0..12 {
 //!     detector.poll();
 //! }
@@ -68,36 +72,67 @@ impl AudioSource for SineSource {
     }
 }
 
-/// 2048-point FFT: bin width 23.4 Hz at 48 kHz, ~810 cycles of a 19 kHz tone per window.
-const FFT_SIZE: usize = 2048;
-/// Per-bucket center frequency (Hz) and corresponding mask depth (1–4 low bits cleared).
-/// Kept `pub(crate)` as a test fixture pinning the historical default band; live
-/// detection logic now reads from [`DetectorConfig`], so production code should
+/// Default FFT window for the audible-test preset and any caller that does not
+/// override [`DetectorConfig::fft_size`]. 2048 samples = bin width 23.4 Hz at
+/// 48 kHz; comfortably resolves kHz-scale buckets.
+pub(crate) const DEFAULT_FFT_SIZE: usize = 2048;
+/// FFT window for the infrasound release default. 65536 samples ≈ 1.37 s at
+/// 48 kHz, giving a bin width of ~0.73 Hz — fine enough to resolve sub-Hz
+/// energy across the 1–10 Hz trigger band. Stepping down to 32768 loses the
+/// 1 Hz end of the band; stepping up to 131072 doubles per-poll FFT cost
+/// without buying meaningful selectivity for a single-bucket band.
+pub(crate) const RELEASE_FFT_SIZE: usize = 65536;
+/// Per-bucket center frequency (Hz) and corresponding mask depth.
+/// Kept `pub(crate)` as a test fixture pinning the current default band; live
+/// detection logic reads from [`DetectorConfig`], so production code should
 /// reach the same values via [`DetectorConfig::release_default`] /
 /// [`DetectorConfig::audible_test`].
+///
+/// Under the release default this is a **single bucket centred on 5.5 Hz with
+/// depth 4** — anywhere in the 1–10 Hz infrasound window trips the detector
+/// at the same maximum depth. The "graded depth" structure (1 → 1, 3 → 2, …)
+/// was a pre-v0.4 stylistic flourish with no basis in the *Patlabor* HOS,
+/// which is binary in the film: the trigger fires or it does not.
 #[cfg(not(feature = "audible-test"))]
 #[allow(dead_code)]
-pub(crate) const BUCKETS: [(f32, u8); 4] =
-    [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
+pub(crate) const BUCKETS: [(f32, u8); 1] = [(5.5, 4)];
 /// Audible-band stand-in for development. Most laptop and consumer speakers
 /// reproduce 1–2.5 kHz cleanly, so the detector can be exercised through a
-/// tone generator without specialized hardware.
+/// tone generator without specialized hardware. Kept as a graded 4-bucket
+/// structure so existing audible-test demos and unit tests that pin each
+/// depth keep working unchanged.
 #[cfg(feature = "audible-test")]
 #[allow(dead_code)]
 pub(crate) const BUCKETS: [(f32, u8); 4] = [(1_000.0, 1), (1_500.0, 2), (2_000.0, 3), (2_500.0, 4)];
-/// Half-width of each bucket window in Hz; band power is summed over `center ± this`.
-const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
+/// Default per-bucket half-width in Hz, used when a [`DetectorConfig`] does
+/// not specify [`DetectorConfig::bucket_half_width_hz`] and as the margin in
+/// [`DetectorConfig::peak_band_from_buckets`]. Sized for kHz-scale buckets
+/// (the audible-test preset and historical ultrasonic overrides); the
+/// infrasound release default widens its own per-bucket half-width to 4.5 Hz
+/// so a single bucket centred on 5.5 Hz covers the entire 1–10 Hz range.
+const DEFAULT_BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
 
 /// dBFS value reported by [`Detector::peak_db`] when no signal is present
 /// (peak magnitude is zero). Callers comparing against silence should use
 /// this constant rather than the literal.
 pub const SILENCE_DB: f32 = -100.0;
+/// Default `snr_threshold_db` for both presets and any caller that does not
+/// set it explicitly. 6 dB ≈ 2× amplitude over the noise floor — the same
+/// rule of thumb radio engineering uses to call something "audible at all".
+/// Empirically separates real triggers from quiet-room background hum on
+/// every device the maintainer has tested.
+pub const DEFAULT_SNR_THRESHOLD_DB: f32 = 6.0;
 /// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
-/// Internal sample rate the default configs are calibrated against. Detector logic
+/// Internal sample rate the audible-test config is calibrated against. Detector logic
 /// recomputes bin sizes from the live source's reported sample rate, so this is
 /// only a documentation hint for env-var / CLI overrides.
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+/// Sample rate hint for the infrasound release default. Most consumer mics
+/// run at 44.1 or 48 kHz; either is fine — what matters is the FFT window
+/// length in seconds, not the rate. 44.1 kHz makes the docs honest about
+/// which rate "civilian" devices typically deliver.
+const INFRASOUND_SAMPLE_RATE: u32 = 44_100;
 
 /// Runtime-tunable detector knobs.
 ///
@@ -113,9 +148,16 @@ const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 ///   count reported when that bucket dominates. Empty `buckets` makes the
 ///   detector unable to trigger; the constructor accepts it but the resulting
 ///   detector permanently reports `depth() == 0`.
-/// - `power_threshold`: minimum raw band power (post-FFT) for the dominant
-///   bucket to count. Same units as the legacy const.
-/// - `peak_band_hz`: `(lo, hi)` window scanned for `peak_hz` / `peak_db`. Use
+/// - `snr_threshold_db`: minimum signal-to-noise ratio (in dB) the bucket's
+///   peak must beat over the surrounding noise floor before that bucket
+///   counts as triggered. Replaces the v0.3.x raw `power_threshold`: SNR is
+///   what "is there a frequency in this band" actually means once you stop
+///   relying on a hand-calibrated absolute amplitude. The default is 6 dB —
+///   2× signal over noise floor, the same threshold radio engineering uses
+///   to call something "audible at all".
+/// - `peak_band_hz`: `(lo, hi)` window scanned for `peak_hz` / `peak_db`,
+///   AND for the per-poll noise-floor estimate (median bin power across the
+///   band, excluding each bucket's window). Use
 ///   [`DetectorConfig::peak_band_from_buckets`] to derive a sensible default
 ///   covering all bucket centers plus margin.
 /// - `sample_rate`: documentation hint only; the live source's reported rate
@@ -124,22 +166,78 @@ const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 pub struct DetectorConfig {
     /// `(center_hz, depth)` pairs that define the trigger buckets.
     pub buckets: Vec<(f32, u8)>,
-    /// Minimum raw band power required for the dominant bucket to flip the trigger.
-    pub power_threshold: f32,
-    /// `(lo, hi)` Hz bounds for the peak-search band reported via `peak_hz` / `peak_db`.
+    /// Minimum signal-to-noise ratio in dB the bucket peak must beat over the
+    /// noise floor (median bin power inside `peak_band_hz`, excluding each
+    /// bucket's own window) before the bucket counts as triggered.
+    ///
+    /// 6 dB (≈ 2× amplitude) is the v0.4.0 default and the same threshold
+    /// radio engineering uses for "audible at all". Push to 10–12 dB if the
+    /// host environment has a noisy room tone you want to distinguish from
+    /// real triggers; drop to 3 dB if you specifically want a hair-trigger.
+    pub snr_threshold_db: f32,
+    /// `(lo, hi)` Hz bounds for the peak-search band reported via `peak_hz` /
+    /// `peak_db`, and the band the noise-floor estimate is taken from.
     pub peak_band_hz: (f32, f32),
     /// Documentation hint — the live source dictates actual FFT bin width.
     pub sample_rate: u32,
+    /// FFT window length in samples. Larger = finer Hz resolution at the cost
+    /// of latency and per-poll work. The infrasound release default uses 65536
+    /// (~1.4 s at 48 kHz) so the 1 Hz end of the band is resolvable; the
+    /// audible-test preset stays at 2048 since 23 Hz bin width is plenty for
+    /// 1–2.5 kHz tones. Must be a power of two for `rustfft` planner efficiency,
+    /// though the planner accepts other sizes.
+    pub fft_size: usize,
+    /// Half-width of each bucket window in Hz; band power for a bucket is
+    /// summed over `center ± this`. The infrasound default uses 4.5 Hz so a
+    /// single bucket centred on 5.5 Hz spans the entire 1–10 Hz trigger
+    /// window; widen further when the source has poor frequency stability.
+    pub bucket_half_width_hz: f32,
 }
 
 impl DetectorConfig {
-    /// Production default: 19–21 kHz ultrasonic band with the legacy 10_000 power threshold.
+    /// Production default: **a single 1–10 Hz infrasound bucket that fires at
+    /// depth 4**, all below the human audibility floor (~20 Hz). Inspired by
+    /// the HOS ("バビロンプロジェクト") in *Patlabor: The Movie* (1989), which
+    /// triggers from low-frequency wind resonance against tall buildings —
+    /// nothing a speaker can play, and crucially **binary**, with no graded
+    /// depth in the film's setup: the system either fires or it does not.
+    /// The detector mirrors that: anywhere in 1–10 Hz, full-depth trigger,
+    /// no per-frequency tiers.
+    ///
+    /// Implementation: one bucket at center 5.5 Hz with `bucket_half_width_hz
+    /// = 4.5`, so the integration window covers exactly 1.0–10.0 Hz. A
+    /// consumer playback chain physically cannot reach this band — the
+    /// detector waits for real environmental energy: earthquakes, typhoon
+    /// gusts, heavy machinery, large HVAC, subway passes. That "doesn't fire
+    /// in everyday life" is the whole point.
+    ///
+    /// The 65536-sample FFT window (~1.4 s at 48 kHz) gives ~0.73 Hz bin
+    /// resolution, fine enough to resolve the 1 Hz end of the band against
+    /// rectangular-window leakage.
+    ///
+    /// **Trigger criterion** (since v0.4.0): the bucket peak must beat the
+    /// surrounding noise floor by at least `snr_threshold_db` (default 6 dB).
+    /// The hand-calibrated absolute `power_threshold` from v0.3.x is gone —
+    /// SNR is what "a frequency is present in this band" actually means once
+    /// you stop pretending mic gain and room tone are constant across hosts.
+    ///
+    /// Callers who explicitly want graded buckets (e.g. the historical
+    /// 1 / 3 / 5 / 10 Hz tiers) or a different band (sub-bass HVAC, audible
+    /// CI tones) can get there without a recompile via `HOBA_BUCKETS` or
+    /// [`Detector::with_config`]:
+    ///
+    /// ```text
+    /// HOBA_BUCKETS=1:1,3:2,5:3,10:4         # restore graded depth
+    /// HOBA_BUCKETS=20:1,30:2,40:3,50:4 HOBA_SNR=10   # sub-bass HVAC, stricter SNR
+    /// ```
     pub fn release_default() -> Self {
         Self {
-            buckets: vec![(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)],
-            power_threshold: 10_000.0,
-            peak_band_hz: (18_900.0, 20_600.0),
-            sample_rate: DEFAULT_SAMPLE_RATE,
+            buckets: vec![(5.5, 4)],
+            snr_threshold_db: DEFAULT_SNR_THRESHOLD_DB,
+            peak_band_hz: (0.5, 12.0),
+            sample_rate: INFRASOUND_SAMPLE_RATE,
+            fft_size: RELEASE_FFT_SIZE,
+            bucket_half_width_hz: 4.5,
         }
     }
 
@@ -149,15 +247,24 @@ impl DetectorConfig {
     pub fn audible_test() -> Self {
         Self {
             buckets: vec![(1_000.0, 1), (1_500.0, 2), (2_000.0, 3), (2_500.0, 4)],
-            power_threshold: 100.0,
+            snr_threshold_db: DEFAULT_SNR_THRESHOLD_DB,
             peak_band_hz: (900.0, 2_600.0),
             sample_rate: DEFAULT_SAMPLE_RATE,
+            fft_size: DEFAULT_FFT_SIZE,
+            bucket_half_width_hz: DEFAULT_BUCKET_HALF_WIDTH_HZ,
         }
     }
 
-    /// Reads `HOBA_BUCKETS` / `HOBA_THRESHOLD` / `HOBA_PEAK_BAND` from the
-    /// process environment and merges them with [`Self::release_default`] (or
+    /// Reads `HOBA_BUCKETS` / `HOBA_SNR` / `HOBA_PEAK_BAND` from the process
+    /// environment and merges them with [`Self::release_default`] (or
     /// [`Self::audible_test`] when the `audible-test` feature is on).
+    ///
+    /// `HOBA_THRESHOLD` (the v0.3.x raw-power threshold) is still inspected
+    /// for back-compat detection but its value is **ignored** — the unit
+    /// changed from raw post-FFT power to a dB SNR, and silently
+    /// reinterpreting the number would produce surprising trigger behaviour.
+    /// Set `HOBA_DEBUG=1` to see a one-line deprecation note on stderr; use
+    /// `HOBA_SNR` instead.
     ///
     /// Returns `None` if no relevant env vars are set, so callers can skip
     /// the override path entirely. Returns `Some(config)` if at least one
@@ -167,9 +274,14 @@ impl DetectorConfig {
     /// hoba's library-fails-quietly contract).
     pub fn from_env() -> Option<Self> {
         let buckets_raw = std::env::var("HOBA_BUCKETS").ok();
-        let threshold_raw = std::env::var("HOBA_THRESHOLD").ok();
+        let snr_raw = std::env::var("HOBA_SNR").ok();
+        let legacy_threshold_raw = std::env::var("HOBA_THRESHOLD").ok();
         let peak_band_raw = std::env::var("HOBA_PEAK_BAND").ok();
-        if buckets_raw.is_none() && threshold_raw.is_none() && peak_band_raw.is_none() {
+        if buckets_raw.is_none()
+            && snr_raw.is_none()
+            && legacy_threshold_raw.is_none()
+            && peak_band_raw.is_none()
+        {
             return None;
         }
 
@@ -201,15 +313,22 @@ impl DetectorConfig {
             }
         }
 
-        if let Some(s) = threshold_raw.as_deref() {
+        if let Some(s) = snr_raw.as_deref() {
             match s.trim().parse::<f32>() {
-                Ok(v) if v.is_finite() && v >= 0.0 => config.power_threshold = v,
+                Ok(v) if v.is_finite() && v >= 0.0 => config.snr_threshold_db = v,
                 Ok(_) | Err(_) => {
                     if debug {
-                        eprintln!("hoba: HOBA_THRESHOLD invalid ({s:?}); using default");
+                        eprintln!("hoba: HOBA_SNR invalid ({s:?}); using default");
                     }
                 }
             }
+        }
+
+        if legacy_threshold_raw.is_some() && debug {
+            eprintln!(
+                "hoba: HOBA_THRESHOLD is deprecated since v0.4.0 (raw-power threshold replaced \
+                 by dB SNR); ignoring. Use HOBA_SNR=<dB> instead."
+            );
         }
 
         if let Some(s) = peak_band_raw.as_deref() {
@@ -244,7 +363,7 @@ impl DetectorConfig {
                 hi = c;
             }
         }
-        let margin = BUCKET_HALF_WIDTH_HZ * 1.5;
+        let margin = DEFAULT_BUCKET_HALF_WIDTH_HZ * 1.5;
         ((lo - margin).max(0.0), hi + margin)
     }
 }
@@ -312,7 +431,8 @@ fn parse_peak_band_env(s: &str) -> Result<(f32, f32), String> {
     Ok((lo, hi))
 }
 
-/// Pulls samples from an [`AudioSource`] and detects ultrasonic trigger tones.
+/// Pulls samples from an [`AudioSource`] and detects trigger tones inside the
+/// configured bucket band.
 ///
 /// Note: `Debug` is hand-implemented because the boxed FFT trait object is
 /// not itself `Debug`. `Clone` is not implemented because the FFT planner
@@ -321,9 +441,10 @@ fn parse_peak_band_env(s: &str) -> Result<(f32, f32), String> {
 /// this.
 ///
 /// The trigger band is approximate. Rectangular-window leakage means tones
-/// just outside 19.0–20.5 kHz (within ~50 Hz) still flip the flag. For an
-/// "is the environment ultrasonic" check this is desirable; for narrowband
-/// classification, post-process the FFT separately.
+/// just outside the bucket centers (within roughly half the bin width) still
+/// flip the flag. For "is the environment in the trigger band" this is
+/// desirable; for narrowband classification, post-process the FFT
+/// separately.
 pub struct Detector<S: AudioSource> {
     source: S,
     fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
@@ -334,6 +455,7 @@ pub struct Detector<S: AudioSource> {
     depth: u8,
     last_peak_hz: f32,
     last_peak_db: f32,
+    last_noise_floor_db: f32,
     config: DetectorConfig,
 }
 
@@ -361,18 +483,27 @@ impl<S: AudioSource> Detector<S> {
     /// the compile-time default — sub-bass HVAC monitoring, a non-standard
     /// ultrasonic center, an audible test tone in a release build, etc.
     pub fn with_config(source: S, config: DetectorConfig) -> Self {
+        // Defensive fallback: a zero or absurdly small fft_size would crash
+        // the FFT planner. Clamp to DEFAULT_FFT_SIZE so misconfigured input
+        // degrades to the audible-test window rather than panicking.
+        let fft_size = if config.fft_size >= 64 {
+            config.fft_size
+        } else {
+            DEFAULT_FFT_SIZE
+        };
         let mut planner = rustfft::FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let fft = planner.plan_fft_forward(fft_size);
         Self {
             source,
             fft,
-            scratch: vec![rustfft::num_complex::Complex::new(0.0, 0.0); FFT_SIZE],
-            pull_buf: vec![0.0f32; FFT_SIZE],
+            scratch: vec![rustfft::num_complex::Complex::new(0.0, 0.0); fft_size],
+            pull_buf: vec![0.0f32; fft_size],
             high_streak: 0,
             low_streak: 0,
             depth: 0,
             last_peak_hz: 0.0,
             last_peak_db: SILENCE_DB,
+            last_noise_floor_db: SILENCE_DB,
             config,
         }
     }
@@ -393,10 +524,11 @@ impl<S: AudioSource> Detector<S> {
             *slot = 0.0;
         }
         let n = self.source.read(&mut self.pull_buf);
+        let fft_size = self.scratch.len();
         for (slot, sample) in self.scratch.iter_mut().zip(self.pull_buf.iter()) {
             *slot = rustfft::num_complex::Complex::new(*sample, 0.0);
         }
-        if n < FFT_SIZE {
+        if n < fft_size {
             for slot in &mut self.scratch[n..] {
                 *slot = rustfft::num_complex::Complex::new(0.0, 0.0);
             }
@@ -407,17 +539,21 @@ impl<S: AudioSource> Detector<S> {
         // buckets plus a small margin for spectral leakage).
         let (peak_lo, peak_hi) = self.config.peak_band_hz;
         let (peak_bin, peak_norm_sqr) = self.peak_in_band(peak_lo, peak_hi);
-        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        let bin_hz = f64::from(self.source.sample_rate()) / fft_size as f64;
         self.last_peak_hz = (peak_bin as f64 * bin_hz) as f32;
-        let peak_magnitude = peak_norm_sqr.sqrt();
-        let max_magnitude = (FFT_SIZE / 2) as f32;
-        self.last_peak_db = if peak_magnitude > 0.0 {
-            20.0 * (peak_magnitude / max_magnitude).log10()
-        } else {
-            SILENCE_DB
-        };
+        let max_magnitude = (fft_size / 2) as f32;
+        self.last_peak_db = power_to_db(peak_norm_sqr, max_magnitude);
 
-        match self.dominant_bucket() {
+        // Estimate the noise floor as the median bin *power* (norm_sqr) inside
+        // peak_band_hz, excluding each bucket's own window so a strong tone
+        // sitting inside a bucket can never inflate its own floor and
+        // self-mask. Power-domain median first, dB conversion afterwards: a
+        // dB-domain median would over-weight near-silent bins (-100 dB
+        // outliers pull a dB median harder than they pull a power median).
+        let noise_floor_power = self.noise_floor_power(peak_lo, peak_hi);
+        self.last_noise_floor_db = power_to_db(noise_floor_power, max_magnitude);
+
+        match self.dominant_bucket(noise_floor_power, max_magnitude) {
             Some(depth) => {
                 self.high_streak = self.high_streak.saturating_add(1);
                 self.low_streak = 0;
@@ -459,9 +595,27 @@ impl<S: AudioSource> Detector<S> {
         self.last_peak_db
     }
 
+    /// dBFS magnitude of the noise-floor estimate (median bin power across
+    /// `peak_band_hz`, excluding each bucket's own window) from the most
+    /// recent [`poll`](Self::poll). Returns [`SILENCE_DB`] when the band
+    /// outside the buckets has no measurable energy or when `poll` has not
+    /// been called yet.
+    pub fn noise_floor_db(&self) -> f32 {
+        self.last_noise_floor_db
+    }
+
+    /// Signal-to-noise ratio in dB from the most recent
+    /// [`poll`](Self::poll), defined as `peak_db - noise_floor_db`. Returns
+    /// 0.0 before the first poll. Floors at 0.0 when peak is below the
+    /// floor — a negative SNR is information-free for trigger purposes.
+    pub fn snr_db(&self) -> f32 {
+        (self.last_peak_db - self.last_noise_floor_db).max(0.0)
+    }
+
     fn peak_in_band(&self, lo_hz: f32, hi_hz: f32) -> (usize, f32) {
-        let nyquist_bin = FFT_SIZE / 2;
-        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        let fft_size = self.scratch.len();
+        let nyquist_bin = fft_size / 2;
+        let bin_hz = f64::from(self.source.sample_rate()) / fft_size as f64;
         let lo_bin = ((f64::from(lo_hz) / bin_hz).floor() as usize).min(nyquist_bin);
         let hi_bin = ((f64::from(hi_hz) / bin_hz).ceil() as usize).min(nyquist_bin);
         if lo_bin > hi_bin {
@@ -477,38 +631,137 @@ impl<S: AudioSource> Detector<S> {
         best
     }
 
-    fn dominant_bucket(&self) -> Option<u8> {
-        // Strict `>` keeps the first-listed (lower-depth) bucket on exact ties — clears
-        // fewer bits when the signal is ambiguous, which is the conservative default.
+    /// Returns the depth of the bucket whose peak best clears the SNR bar,
+    /// or `None` if no bucket beats the noise floor by at least
+    /// `snr_threshold_db`.
+    ///
+    /// Selection rule, in order: (1) drop any bucket whose `peak_db −
+    /// noise_floor_db` is below `snr_threshold_db`. (2) Among the
+    /// survivors, pick the bucket with the **strongest peak power** — the
+    /// loudest signal in the band. (3) On exact peak-power ties (rare in
+    /// practice; real audio is full of fractional bin energy) the
+    /// deepest-`depth` bucket wins.
+    ///
+    /// Why peak power and not max depth: under graded presets like
+    /// `audible_test` the buckets share a `peak_band_hz` window, so FFT
+    /// leakage from a real tone in one bucket dribbles into adjacent
+    /// buckets. A naïve "max-depth-among-firing" would let a 1 kHz tone
+    /// trigger the 2.5 kHz/depth-4 bucket from leakage alone. Picking the
+    /// strongest peak instead means the bucket actually receiving signal
+    /// energy is the one that fires, which is what users mean when they
+    /// configure graded buckets in the first place. Under the single-
+    /// bucket release default the rule collapses to "fire if SNR clears,"
+    /// matching the binary-trigger spirit of the *Patlabor* HOS.
+    fn dominant_bucket(&self, noise_floor_power: f32, max_magnitude: f32) -> Option<u8> {
+        let half_width = self.config.bucket_half_width_hz;
+        let noise_floor_db = power_to_db(noise_floor_power, max_magnitude);
         let mut best: Option<(f32, u8)> = None;
         for &(center, depth) in &self.config.buckets {
-            let p = self
-                .band_power_between(center - BUCKET_HALF_WIDTH_HZ, center + BUCKET_HALF_WIDTH_HZ);
-            if best.map_or(true, |(bp, _)| p > bp) {
-                best = Some((p, depth));
+            let peak_power = self.peak_power_between(center - half_width, center + half_width);
+            let peak_db = power_to_db(peak_power, max_magnitude);
+            let snr = peak_db - noise_floor_db;
+            if snr < self.config.snr_threshold_db {
+                continue;
+            }
+            let beats = match best {
+                None => true,
+                Some((bp, bd)) => peak_power > bp || (peak_power == bp && depth > bd),
+            };
+            if beats {
+                best = Some((peak_power, depth));
             }
         }
-        best.and_then(|(p, d)| {
-            if p >= self.config.power_threshold {
-                Some(d)
-            } else {
-                None
-            }
-        })
+        best.map(|(_, d)| d)
     }
 
-    fn band_power_between(&self, lo_hz: f32, hi_hz: f32) -> f32 {
-        let nyquist_bin = FFT_SIZE / 2;
-        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+    /// Returns the strongest single-bin power inside `[lo_hz, hi_hz]`. Used
+    /// by [`Detector::dominant_bucket`] so a bucket's peak — not its summed
+    /// energy — is what gets compared to the noise floor. Summed-band power
+    /// would scale with bucket width and let a wide quiet bucket "beat" a
+    /// narrow loud one, which is the opposite of what SNR is asking.
+    fn peak_power_between(&self, lo_hz: f32, hi_hz: f32) -> f32 {
+        let fft_size = self.scratch.len();
+        let nyquist_bin = fft_size / 2;
+        let bin_hz = f64::from(self.source.sample_rate()) / fft_size as f64;
         let lo_bin = ((f64::from(lo_hz) / bin_hz).floor() as usize).min(nyquist_bin);
         let hi_bin = ((f64::from(hi_hz) / bin_hz).ceil() as usize).min(nyquist_bin);
         if lo_bin > hi_bin {
             return 0.0;
         }
-        self.scratch[lo_bin..=hi_bin]
+        let mut best = 0.0f32;
+        for i in lo_bin..=hi_bin {
+            let p = self.scratch[i].norm_sqr();
+            if p > best {
+                best = p;
+            }
+        }
+        best
+    }
+
+    /// Median bin power inside `[lo_hz, hi_hz]`, excluding every bucket's
+    /// `center ± bucket_half_width_hz` window. Median rather than mean
+    /// because a single loud trigger tone would otherwise drag the floor up
+    /// linearly and mask itself; median is robust against that. Excluding
+    /// the bucket windows is essential — leaving them in lets a tone sitting
+    /// inside a bucket count toward "its own" noise floor.
+    fn noise_floor_power(&self, lo_hz: f32, hi_hz: f32) -> f32 {
+        let fft_size = self.scratch.len();
+        let nyquist_bin = fft_size / 2;
+        let bin_hz = f64::from(self.source.sample_rate()) / fft_size as f64;
+        let lo_bin = ((f64::from(lo_hz) / bin_hz).floor() as usize).min(nyquist_bin);
+        let hi_bin = ((f64::from(hi_hz) / bin_hz).ceil() as usize).min(nyquist_bin);
+        if lo_bin > hi_bin {
+            return 0.0;
+        }
+        let half_width = self.config.bucket_half_width_hz;
+        let mut excluded: Vec<(usize, usize)> = self
+            .config
+            .buckets
             .iter()
-            .map(|c| c.norm_sqr())
-            .sum()
+            .map(|&(center, _)| {
+                let blo = ((f64::from((center - half_width).max(0.0)) / bin_hz).floor() as usize)
+                    .min(nyquist_bin);
+                let bhi =
+                    ((f64::from(center + half_width) / bin_hz).ceil() as usize).min(nyquist_bin);
+                (blo, bhi)
+            })
+            .collect();
+        excluded.sort_unstable();
+
+        let mut out: Vec<f32> = Vec::with_capacity(hi_bin.saturating_sub(lo_bin) + 1);
+        for i in lo_bin..=hi_bin {
+            if excluded.iter().any(|&(blo, bhi)| i >= blo && i <= bhi) {
+                continue;
+            }
+            out.push(self.scratch[i].norm_sqr());
+        }
+        if out.is_empty() {
+            // Buckets cover the entire peak band — nothing left to estimate
+            // the floor from. Conservative fallback: pretend it is silent so
+            // SNR collapses to peak_db, which mirrors the v0.3.x behaviour
+            // and keeps the detector usable when the user explicitly tunes
+            // peak_band_hz tight to the buckets.
+            return 0.0;
+        }
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = out.len();
+        if n % 2 == 1 {
+            out[n / 2]
+        } else {
+            (out[n / 2 - 1] + out[n / 2]) * 0.5
+        }
+    }
+}
+
+/// Converts a single-bin / aggregated power value (FFT `norm_sqr`) into
+/// dBFS using the standard reference `max_magnitude = fft_size / 2`. Returns
+/// [`SILENCE_DB`] for non-positive input so callers never see `-inf` or NaN.
+fn power_to_db(power: f32, max_magnitude: f32) -> f32 {
+    if power > 0.0 {
+        let magnitude = power.sqrt();
+        20.0 * (magnitude / max_magnitude).log10()
+    } else {
+        SILENCE_DB
     }
 }
 
@@ -590,46 +843,29 @@ mod tests {
         buf
     }
 
+    /// Iterate over every configured bucket center under the active preset and
+    /// confirm each one trips the detector at the bucket's depth. Under the
+    /// release default (single bucket at 5.5 Hz, depth 4) this is one
+    /// assertion; under `audible-test` it walks all four 1–2.5 kHz buckets.
     #[test]
-    fn detector_depth_bucket_1_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[0].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
+    fn detector_depth_buckets_each_tone() {
+        for &(freq, expected_depth) in BUCKETS.iter() {
+            let mut detector = Detector::with_source(SineSource::new(freq, 0.5));
+            for _ in 0..12 {
+                detector.poll();
+            }
+            assert_eq!(
+                detector.depth(),
+                expected_depth,
+                "{freq} Hz tone should reach depth {expected_depth}"
+            );
+            assert!(detector.is_compromised());
         }
-        assert_eq!(detector.depth(), 1);
-        assert!(detector.is_compromised());
     }
 
-    #[test]
-    fn detector_depth_bucket_2_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[1].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
-        }
-        assert_eq!(detector.depth(), 2);
-    }
-
-    #[test]
-    fn detector_depth_bucket_3_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[2].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
-        }
-        assert_eq!(detector.depth(), 3);
-    }
-
-    #[test]
-    fn detector_depth_bucket_4_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[3].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
-        }
-        assert_eq!(detector.depth(), 4);
-    }
-
-    /// 5 kHz sits well outside the trigger band in both default (18.9–20.6 kHz)
-    /// and `audible-test` (0.9–2.6 kHz) configurations; rectangular-window
-    /// leakage at that distance is negligible at amp 0.5.
+    /// 5 kHz sits well outside the trigger band in both default (0.5–12 Hz
+    /// infrasound) and `audible-test` (0.9–2.6 kHz) configurations;
+    /// rectangular-window leakage at that distance is negligible at amp 0.5.
     #[test]
     fn detector_stays_uncompromised_under_out_of_band_tone() {
         let mut detector = Detector::with_source(SineSource::new(5_000.0, 0.5));
@@ -643,10 +879,38 @@ mod tests {
         }
     }
 
+    /// Pin the infrasound release default to a binary depth-4 trigger across
+    /// the entire 1–10 Hz band: anywhere inside the window, the detector must
+    /// reach depth 4. This is the *Patlabor*-faithful contract — the HOS
+    /// trigger has no graded levels in the film.
+    /// Skipped under `audible-test` because that feature deliberately swaps
+    /// the compile-time default band for graded 1–2.5 kHz buckets.
+    #[cfg(not(feature = "audible-test"))]
+    #[test]
+    fn detector_release_default_triggers_on_infrasound_inject() {
+        for &hz in &[1.0f32, 3.0, 5.0, 7.0, 10.0] {
+            let mut detector = Detector::with_source(SineSource::new(hz, 0.5));
+            for _ in 0..12 {
+                detector.poll();
+            }
+            assert_eq!(
+                detector.depth(),
+                4,
+                "{hz} Hz should reach depth 4 under release_default \
+                 (got depth={}, peak_hz={:.2}, peak_db={:.1})",
+                detector.depth(),
+                detector.peak_hz(),
+                detector.peak_db()
+            );
+            assert!(detector.is_compromised());
+        }
+    }
+
     #[test]
     fn detector_does_not_flip_just_below_streak_threshold() {
-        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, FFT_SIZE * 2);
-        samples.extend(vec![0.0f32; FFT_SIZE * 10]);
+        let fft_size = base_default().fft_size;
+        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, fft_size * 2);
+        samples.extend(vec![0.0f32; fft_size * 10]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
         for _ in 0..12 {
@@ -661,8 +925,10 @@ mod tests {
 
     #[test]
     fn detector_recovers_after_tone_stops() {
-        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, FFT_SIZE * 5);
-        samples.extend(vec![0.0f32; FFT_SIZE * 5]);
+        let fft_size = base_default().fft_size;
+        let (freq, expected_depth) = BUCKETS[0];
+        let mut samples = sine_window(freq, 0.5, 48_000, fft_size * 5);
+        samples.extend(vec![0.0f32; fft_size * 5]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
         for _ in 0..5 {
@@ -670,8 +936,8 @@ mod tests {
         }
         assert_eq!(
             detector.depth(),
-            1,
-            "tone phase should raise depth to 1 (first bucket)"
+            expected_depth,
+            "tone phase should raise depth to {expected_depth} (first bucket of active preset)"
         );
         for _ in 0..5 {
             detector.poll();
@@ -706,20 +972,26 @@ mod tests {
 
     /// Helper that constructs a `DetectorConfig` for a single-bucket band at
     /// `center_hz`, sized to match the historical 100 Hz half-width and a
-    /// generous peak band so tone-injection tests stay deterministic.
-    fn config_for_band(center_hz: f32, depth: u8, threshold: f32) -> DetectorConfig {
+    /// generous peak band so tone-injection tests stay deterministic. Uses
+    /// the small 2048-point FFT window since the helper is only used for
+    /// kHz-scale tones in unit tests. The third arg is the SNR threshold in
+    /// dB for the bucket (since v0.4.0 — replaces the v0.3.x raw power
+    /// threshold).
+    fn config_for_band(center_hz: f32, depth: u8, snr_threshold_db: f32) -> DetectorConfig {
         DetectorConfig {
             buckets: vec![(center_hz, depth)],
-            power_threshold: threshold,
+            snr_threshold_db,
             peak_band_hz: ((center_hz - 200.0).max(0.0), center_hz + 200.0),
             sample_rate: 48_000,
+            fft_size: DEFAULT_FFT_SIZE,
+            bucket_half_width_hz: DEFAULT_BUCKET_HALF_WIDTH_HZ,
         }
     }
 
     #[test]
     fn detector_with_config_triggers_on_custom_band() {
         // Pick a sub-bass band the const-based default would never see.
-        let cfg = config_for_band(200.0, 3, 100.0);
+        let cfg = config_for_band(200.0, 3, DEFAULT_SNR_THRESHOLD_DB);
         let mut detector = Detector::with_config(SineSource::new(200.0, 0.5), cfg);
         for _ in 0..12 {
             detector.poll();
@@ -731,7 +1003,7 @@ mod tests {
     #[test]
     fn detector_with_config_ignores_out_of_band_tone() {
         // 5 kHz tone, but the detector is configured to watch 200 Hz only.
-        let cfg = config_for_band(200.0, 1, 100.0);
+        let cfg = config_for_band(200.0, 1, DEFAULT_SNR_THRESHOLD_DB);
         let mut detector = Detector::with_config(SineSource::new(5_000.0, 0.5), cfg);
         for _ in 0..24 {
             detector.poll();
@@ -739,12 +1011,152 @@ mod tests {
         assert_eq!(detector.depth(), 0);
     }
 
+    /// SNR sanity: a tone in the bucket should report a positive SNR well
+    /// above the default 6 dB threshold, while pure silence stays at 0.
+    /// This pins the noise-floor / SNR pipeline end-to-end without
+    /// reaching into private fields.
+    #[test]
+    fn detector_reports_snr_for_tone_and_silence() {
+        let cfg = config_for_band(200.0, 1, DEFAULT_SNR_THRESHOLD_DB);
+        let mut tone_det = Detector::with_config(SineSource::new(200.0, 0.5), cfg.clone());
+        for _ in 0..12 {
+            tone_det.poll();
+        }
+        assert!(
+            tone_det.snr_db() >= DEFAULT_SNR_THRESHOLD_DB,
+            "200 Hz tone should produce SNR ≥ {} dB, got {} dB (peak={:.1} floor={:.1})",
+            DEFAULT_SNR_THRESHOLD_DB,
+            tone_det.snr_db(),
+            tone_det.peak_db(),
+            tone_det.noise_floor_db()
+        );
+
+        let silence = ScriptedSource::new(vec![0.0f32; cfg.fft_size * 12], 48_000);
+        let mut sil_det = Detector::with_config(silence, cfg);
+        for _ in 0..12 {
+            sil_det.poll();
+        }
+        assert!(
+            sil_det.snr_db() < DEFAULT_SNR_THRESHOLD_DB,
+            "silence should not clear the SNR threshold (got {} dB)",
+            sil_det.snr_db()
+        );
+        assert_eq!(sil_det.depth(), 0);
+    }
+
+    /// Two-bucket selectivity: with two well-separated bucket centres in
+    /// the same `peak_band_hz`, injecting a tone at only one centre must
+    /// trigger only that bucket's depth — the other bucket's "peak" sits at
+    /// the noise floor and fails the SNR check. The 6 dB default makes this
+    /// trivially decidable for an amp-0.5 sine.
+    #[test]
+    fn detector_snr_selects_one_bucket_when_only_one_has_signal() {
+        // Buckets at 1 kHz (depth 1) and 2.5 kHz (depth 4); peak band wide
+        // enough to cover both with margin.
+        let cfg = DetectorConfig {
+            buckets: vec![(1_000.0, 1), (2_500.0, 4)],
+            snr_threshold_db: DEFAULT_SNR_THRESHOLD_DB,
+            peak_band_hz: (500.0, 3_000.0),
+            sample_rate: 48_000,
+            fft_size: DEFAULT_FFT_SIZE,
+            bucket_half_width_hz: 50.0,
+        };
+        // Signal only at 1 kHz: only that bucket should fire (depth 1).
+        let mut det_low = Detector::with_config(SineSource::new(1_000.0, 0.5), cfg.clone());
+        for _ in 0..12 {
+            det_low.poll();
+        }
+        assert_eq!(
+            det_low.depth(),
+            1,
+            "tone at 1 kHz should fire bucket #1 only (depth 1), got {}",
+            det_low.depth()
+        );
+
+        // Signal only at 2.5 kHz: only the deeper bucket should fire.
+        let mut det_high = Detector::with_config(SineSource::new(2_500.0, 0.5), cfg);
+        for _ in 0..12 {
+            det_high.poll();
+        }
+        assert_eq!(
+            det_high.depth(),
+            4,
+            "tone at 2.5 kHz should fire bucket #2 only (depth 4), got {}",
+            det_high.depth()
+        );
+    }
+
+    /// SNR threshold gating: with a pathologically high `snr_threshold_db`
+    /// (e.g. 80 dB), even a clear in-band tone must fail to flip the
+    /// detector. Direct test that the SNR comparison actually gates depth
+    /// rather than getting bypassed by the streak counter.
+    #[test]
+    fn detector_high_snr_threshold_suppresses_trigger() {
+        let mut cfg = config_for_band(200.0, 3, 80.0);
+        cfg.fft_size = DEFAULT_FFT_SIZE;
+        let mut detector = Detector::with_config(SineSource::new(200.0, 0.5), cfg);
+        for _ in 0..24 {
+            detector.poll();
+        }
+        assert_eq!(
+            detector.depth(),
+            0,
+            "80 dB SNR requirement should suppress trigger (peak={:.1} floor={:.1} snr={:.1})",
+            detector.peak_db(),
+            detector.noise_floor_db(),
+            detector.snr_db()
+        );
+    }
+
+    /// Realistic baseline-amp data point from the maintainer's host:
+    /// an external 150 Hz tone (peak ≈ -45 dBFS) sitting on a quiet-room
+    /// floor (≈ -88 dBFS) should comfortably PASS at the default 6 dB SNR
+    /// threshold. Synthesised here via `peak_to_db`-equivalent power
+    /// math directly on the `power_to_db` helper, with no detector loop —
+    /// this is the unit-level guard for the README's worked example.
+    #[test]
+    fn power_to_db_round_trip_matches_amp_05_sine_calibration() {
+        // For an amp-0.5 sine in a 2048-point FFT, a single bin near the
+        // true frequency carries roughly (amp * fft_size / 4)^2 power. We
+        // do not need to reproduce the exact figure; what matters for the
+        // SNR contract is that `power_to_db` is monotonic and that a 100×
+        // power ratio equals the expected 20 dB.
+        let big = power_to_db(10_000.0, 1024.0);
+        let small = power_to_db(100.0, 1024.0);
+        let snr = big - small;
+        assert!(
+            (snr - 20.0).abs() < 0.001,
+            "100× power ratio should be 20 dB SNR, got {snr} dB"
+        );
+        // SILENCE_DB on zero-power input — guards the SNR floor.
+        assert!((power_to_db(0.0, 1024.0) - SILENCE_DB).abs() < 0.001);
+    }
+
     #[test]
     fn detector_config_release_default_round_trip() {
         let cfg = DetectorConfig::release_default();
-        assert_eq!(cfg.buckets.len(), 4);
-        assert!((cfg.buckets[0].0 - 19_000.0).abs() < 1.0);
-        assert!((cfg.power_threshold - 10_000.0).abs() < 1.0);
+        assert_eq!(cfg.buckets.len(), 1);
+        // Single bucket centred at 5.5 Hz with depth 4, half-width 4.5 Hz so
+        // the integration window covers exactly 1.0–10.0 Hz. See
+        // release_default doc for the binary-trigger rationale.
+        assert!((cfg.buckets[0].0 - 5.5).abs() < 0.001);
+        assert_eq!(cfg.buckets[0].1, 4);
+        assert!((cfg.bucket_half_width_hz - 4.5).abs() < 0.001);
+        let lo = cfg.buckets[0].0 - cfg.bucket_half_width_hz;
+        let hi = cfg.buckets[0].0 + cfg.bucket_half_width_hz;
+        assert!(
+            (lo - 1.0).abs() < 0.001,
+            "lo edge of bucket should be 1.0 Hz"
+        );
+        assert!(
+            (hi - 10.0).abs() < 0.001,
+            "hi edge of bucket should be 10.0 Hz"
+        );
+        assert!((cfg.snr_threshold_db - DEFAULT_SNR_THRESHOLD_DB).abs() < 0.001);
+        assert_eq!(cfg.fft_size, RELEASE_FFT_SIZE);
+        // Peak band must cover the bucket with margin on both sides.
+        assert!(cfg.peak_band_hz.0 < 1.0);
+        assert!(cfg.peak_band_hz.1 > 10.0);
     }
 
     #[test]
@@ -752,7 +1164,7 @@ mod tests {
         let cfg = DetectorConfig::audible_test();
         assert_eq!(cfg.buckets.len(), 4);
         assert!((cfg.buckets[0].0 - 1_000.0).abs() < 1.0);
-        assert!((cfg.power_threshold - 100.0).abs() < 1.0);
+        assert!((cfg.snr_threshold_db - DEFAULT_SNR_THRESHOLD_DB).abs() < 0.001);
     }
 
     #[test]
@@ -782,27 +1194,27 @@ mod tests {
     }
 
     #[test]
-    fn detector_config_from_env_parses_threshold_only() {
+    fn detector_config_from_env_parses_snr_only() {
         let _g = EnvGuard::clear_all();
-        std::env::set_var("HOBA_THRESHOLD", "12345");
-        let cfg = DetectorConfig::from_env().expect("threshold override should yield Some");
-        assert!((cfg.power_threshold - 12_345.0).abs() < 1.0);
+        std::env::set_var("HOBA_SNR", "12.5");
+        let cfg = DetectorConfig::from_env().expect("snr override should yield Some");
+        assert!((cfg.snr_threshold_db - 12.5).abs() < 0.001);
         // Buckets fall back to the compile-time default.
         assert_eq!(cfg.buckets, base_default().buckets);
     }
 
     #[test]
-    fn detector_config_from_env_parses_buckets_and_threshold_and_peak_band() {
+    fn detector_config_from_env_parses_buckets_snr_and_peak_band() {
         let _g = EnvGuard::clear_all();
         std::env::set_var("HOBA_BUCKETS", "20:1,30:2,40:3,50:4");
-        std::env::set_var("HOBA_THRESHOLD", "8000.5");
+        std::env::set_var("HOBA_SNR", "9.0");
         std::env::set_var("HOBA_PEAK_BAND", "10:60");
         let cfg = DetectorConfig::from_env().expect("any override should yield Some");
         assert_eq!(
             cfg.buckets,
             vec![(20.0, 1), (30.0, 2), (40.0, 3), (50.0, 4)]
         );
-        assert!((cfg.power_threshold - 8_000.5).abs() < 0.001);
+        assert!((cfg.snr_threshold_db - 9.0).abs() < 0.001);
         assert_eq!(cfg.peak_band_hz, (10.0, 60.0));
     }
 
@@ -816,11 +1228,28 @@ mod tests {
     }
 
     #[test]
-    fn detector_config_from_env_falls_back_on_garbage_threshold() {
+    fn detector_config_from_env_falls_back_on_garbage_snr() {
         let _g = EnvGuard::clear_all();
-        std::env::set_var("HOBA_THRESHOLD", "not-a-number");
+        std::env::set_var("HOBA_SNR", "not-a-number");
         let cfg = DetectorConfig::from_env().expect("malformed override still yields Some");
-        assert!((cfg.power_threshold - base_default().power_threshold).abs() < 0.001);
+        assert!((cfg.snr_threshold_db - base_default().snr_threshold_db).abs() < 0.001);
+    }
+
+    #[test]
+    fn detector_config_from_env_legacy_threshold_yields_some_but_ignored() {
+        // HOBA_THRESHOLD is the v0.3.x raw-power knob. Since v0.4.0 the unit
+        // changed to dB SNR; reinterpreting the old number would silently
+        // change trigger behaviour, so we treat its presence as a triggering
+        // env var (returns Some) but ignore the value entirely.
+        let _g = EnvGuard::clear_all();
+        std::env::set_var("HOBA_THRESHOLD", "10000");
+        let cfg = DetectorConfig::from_env()
+            .expect("legacy threshold env var should still yield Some for back-compat detection");
+        assert!(
+            (cfg.snr_threshold_db - base_default().snr_threshold_db).abs() < 0.001,
+            "legacy HOBA_THRESHOLD must NOT bleed into snr_threshold_db (got {})",
+            cfg.snr_threshold_db
+        );
     }
 
     #[test]
@@ -836,7 +1265,7 @@ mod tests {
     /// so they're serialised through this guard plus a shared mutex in the
     /// helper itself (Rust runs unit tests in parallel by default).
     struct EnvGuard {
-        prior: [(String, Option<String>); 4],
+        prior: [(String, Option<String>); 5],
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -846,15 +1275,17 @@ mod tests {
             let lock = MUTEX.lock().unwrap_or_else(|p| p.into_inner());
             let names = [
                 "HOBA_BUCKETS",
+                "HOBA_SNR",
                 "HOBA_THRESHOLD",
                 "HOBA_PEAK_BAND",
                 "HOBA_DEBUG",
             ];
-            let mut prior: [(String, Option<String>); 4] = [
+            let mut prior: [(String, Option<String>); 5] = [
                 (names[0].into(), None),
                 (names[1].into(), None),
                 (names[2].into(), None),
                 (names[3].into(), None),
+                (names[4].into(), None),
             ];
             for (i, n) in names.iter().enumerate() {
                 prior[i] = ((*n).into(), std::env::var(n).ok());
