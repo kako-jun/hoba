@@ -3,10 +3,12 @@
 //! ```no_run
 //! use hoba::audio::{Detector, SineSource};
 //!
-//! // 1 Hz sits inside the production trigger band (1–10 Hz infrasound).
-//! // Note: real consumer speakers cannot reproduce this — see
+//! // Any tone in the 1–10 Hz infrasound band trips the production default at
+//! // depth 4 — the detector is intentionally binary (single-bucket, single
+//! // depth), matching Patlabor's HOS where the trigger has no graded levels.
+//! // Real consumer speakers cannot reproduce this — see
 //! // [`DetectorConfig::release_default`] for the rationale.
-//! let mut detector = Detector::with_source(SineSource::new(1.0, 0.5));
+//! let mut detector = Detector::with_source(SineSource::new(5.0, 0.5));
 //! for _ in 0..12 {
 //!     detector.poll();
 //! }
@@ -75,23 +77,30 @@ impl AudioSource for SineSource {
 /// 48 kHz; comfortably resolves kHz-scale buckets.
 pub(crate) const DEFAULT_FFT_SIZE: usize = 2048;
 /// FFT window for the infrasound release default. 65536 samples ≈ 1.37 s at
-/// 48 kHz, giving a bin width of ~0.73 Hz — fine enough to discriminate the
-/// 1 / 3 / 5 / 10 Hz buckets even with rectangular-window leakage. Stepping
-/// down to 32768 collapses the 1 Hz and 3 Hz bins; stepping up to 131072
-/// doubles per-poll FFT cost without buying meaningful selectivity at the
-/// chosen bucket spacing.
+/// 48 kHz, giving a bin width of ~0.73 Hz — fine enough to resolve sub-Hz
+/// energy across the 1–10 Hz trigger band. Stepping down to 32768 loses the
+/// 1 Hz end of the band; stepping up to 131072 doubles per-poll FFT cost
+/// without buying meaningful selectivity for a single-bucket band.
 pub(crate) const RELEASE_FFT_SIZE: usize = 65536;
-/// Per-bucket center frequency (Hz) and corresponding mask depth (1–4 low bits cleared).
+/// Per-bucket center frequency (Hz) and corresponding mask depth.
 /// Kept `pub(crate)` as a test fixture pinning the current default band; live
 /// detection logic reads from [`DetectorConfig`], so production code should
 /// reach the same values via [`DetectorConfig::release_default`] /
 /// [`DetectorConfig::audible_test`].
+///
+/// Under the release default this is a **single bucket centred on 5.5 Hz with
+/// depth 4** — anywhere in the 1–10 Hz infrasound window trips the detector
+/// at the same maximum depth. The "graded depth" structure (1 → 1, 3 → 2, …)
+/// was a pre-v0.4 stylistic flourish with no basis in the *Patlabor* HOS,
+/// which is binary in the film: the trigger fires or it does not.
 #[cfg(not(feature = "audible-test"))]
 #[allow(dead_code)]
-pub(crate) const BUCKETS: [(f32, u8); 4] = [(1.0, 1), (3.0, 2), (5.0, 3), (10.0, 4)];
+pub(crate) const BUCKETS: [(f32, u8); 1] = [(5.5, 4)];
 /// Audible-band stand-in for development. Most laptop and consumer speakers
 /// reproduce 1–2.5 kHz cleanly, so the detector can be exercised through a
-/// tone generator without specialized hardware.
+/// tone generator without specialized hardware. Kept as a graded 4-bucket
+/// structure so existing audible-test demos and unit tests that pin each
+/// depth keep working unchanged.
 #[cfg(feature = "audible-test")]
 #[allow(dead_code)]
 pub(crate) const BUCKETS: [(f32, u8); 4] = [(1_000.0, 1), (1_500.0, 2), (2_000.0, 3), (2_500.0, 4)];
@@ -99,8 +108,8 @@ pub(crate) const BUCKETS: [(f32, u8); 4] = [(1_000.0, 1), (1_500.0, 2), (2_000.0
 /// not specify [`DetectorConfig::bucket_half_width_hz`] and as the margin in
 /// [`DetectorConfig::peak_band_from_buckets`]. Sized for kHz-scale buckets
 /// (the audible-test preset and historical ultrasonic overrides); the
-/// infrasound release default narrows this to 1.0 Hz so 1 / 3 / 5 / 10 Hz
-/// buckets do not pollute each other.
+/// infrasound release default widens its own per-bucket half-width to 4.5 Hz
+/// so a single bucket centred on 5.5 Hz covers the entire 1–10 Hz range.
 const DEFAULT_BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
 
 /// dBFS value reported by [`Detector::peak_db`] when no signal is present
@@ -165,31 +174,46 @@ pub struct DetectorConfig {
 }
 
 impl DetectorConfig {
-    /// Production default: **infrasound 1 / 3 / 5 / 10 Hz**, all below the
-    /// human audibility floor (~20 Hz). Inspired by the HOS ("バビロンプロジェクト")
-    /// in *Patlabor: The Movie* (1989), which fires from low-frequency wind
-    /// resonance rather than anything speakers can play. A consumer playback
-    /// chain physically cannot trigger this default — the detector waits for
-    /// real environmental energy: earthquakes, typhoon gusts, heavy machinery,
-    /// large HVAC, subway passes. That "doesn't fire in everyday life" is the
-    /// whole point.
+    /// Production default: **a single 1–10 Hz infrasound bucket that fires at
+    /// depth 4**, all below the human audibility floor (~20 Hz). Inspired by
+    /// the HOS ("バビロンプロジェクト") in *Patlabor: The Movie* (1989), which
+    /// triggers from low-frequency wind resonance against tall buildings —
+    /// nothing a speaker can play, and crucially **binary**, with no graded
+    /// depth in the film's setup: the system either fires or it does not.
+    /// The detector mirrors that: anywhere in 1–10 Hz, full-depth trigger,
+    /// no per-frequency tiers.
     ///
-    /// Threshold and FFT window are sized together: the 65536-sample window
-    /// (~1.4 s at 48 kHz) gives ~0.73 Hz bin resolution, just fine enough to
-    /// keep the buckets distinct under rectangular-window leakage.
+    /// Implementation: one bucket at center 5.5 Hz with `bucket_half_width_hz
+    /// = 4.5`, so the integration window covers exactly 1.0–10.0 Hz. A
+    /// consumer playback chain physically cannot reach this band — the
+    /// detector waits for real environmental energy: earthquakes, typhoon
+    /// gusts, heavy machinery, large HVAC, subway passes. That "doesn't fire
+    /// in everyday life" is the whole point.
     ///
-    /// Callers who explicitly want a different band (sub-bass HVAC, the old
-    /// ultrasonic 19–21 kHz placeholder, audible CI tones) can still get
-    /// there without a recompile via `HOBA_BUCKETS` or
-    /// [`Detector::with_config`].
+    /// The 65536-sample FFT window (~1.4 s at 48 kHz) gives ~0.73 Hz bin
+    /// resolution, fine enough to resolve the 1 Hz end of the band against
+    /// rectangular-window leakage. The threshold is the same 10_000 used by
+    /// the previous graded-depth design — re-tuning it would have changed the
+    /// trigger sensitivity, which is orthogonal to the binary-vs-graded
+    /// question this default is settling.
+    ///
+    /// Callers who explicitly want graded buckets (e.g. the historical
+    /// 1 / 3 / 5 / 10 Hz tiers) or a different band (sub-bass HVAC, audible
+    /// CI tones) can get there without a recompile via `HOBA_BUCKETS` or
+    /// [`Detector::with_config`]:
+    ///
+    /// ```text
+    /// HOBA_BUCKETS=1:1,3:2,5:3,10:4   # restore graded depth
+    /// HOBA_BUCKETS=20:1,30:2,40:3,50:4 HOBA_THRESHOLD=1000   # sub-bass HVAC
+    /// ```
     pub fn release_default() -> Self {
         Self {
-            buckets: vec![(1.0, 1), (3.0, 2), (5.0, 3), (10.0, 4)],
+            buckets: vec![(5.5, 4)],
             power_threshold: 10_000.0,
             peak_band_hz: (0.5, 12.0),
             sample_rate: INFRASOUND_SAMPLE_RATE,
             fft_size: RELEASE_FFT_SIZE,
-            bucket_half_width_hz: 1.0,
+            bucket_half_width_hz: 4.5,
         }
     }
 
@@ -655,41 +679,24 @@ mod tests {
         buf
     }
 
+    /// Iterate over every configured bucket center under the active preset and
+    /// confirm each one trips the detector at the bucket's depth. Under the
+    /// release default (single bucket at 5.5 Hz, depth 4) this is one
+    /// assertion; under `audible-test` it walks all four 1–2.5 kHz buckets.
     #[test]
-    fn detector_depth_bucket_1_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[0].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
+    fn detector_depth_buckets_each_tone() {
+        for &(freq, expected_depth) in BUCKETS.iter() {
+            let mut detector = Detector::with_source(SineSource::new(freq, 0.5));
+            for _ in 0..12 {
+                detector.poll();
+            }
+            assert_eq!(
+                detector.depth(),
+                expected_depth,
+                "{freq} Hz tone should reach depth {expected_depth}"
+            );
+            assert!(detector.is_compromised());
         }
-        assert_eq!(detector.depth(), 1);
-        assert!(detector.is_compromised());
-    }
-
-    #[test]
-    fn detector_depth_bucket_2_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[1].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
-        }
-        assert_eq!(detector.depth(), 2);
-    }
-
-    #[test]
-    fn detector_depth_bucket_3_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[2].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
-        }
-        assert_eq!(detector.depth(), 3);
-    }
-
-    #[test]
-    fn detector_depth_bucket_4_tone() {
-        let mut detector = Detector::with_source(SineSource::new(BUCKETS[3].0, 0.5));
-        for _ in 0..12 {
-            detector.poll();
-        }
-        assert_eq!(detector.depth(), 4);
     }
 
     /// 5 kHz sits well outside the trigger band in both default (0.5–12 Hz
@@ -708,23 +715,24 @@ mod tests {
         }
     }
 
-    /// Pin the infrasound release default to its four target depths via
-    /// explicit literal frequencies (not `BUCKETS[..]`), so renaming or
-    /// resizing `BUCKETS` cannot silently break the v0.4.0 contract.
+    /// Pin the infrasound release default to a binary depth-4 trigger across
+    /// the entire 1–10 Hz band: anywhere inside the window, the detector must
+    /// reach depth 4. This is the *Patlabor*-faithful contract — the HOS
+    /// trigger has no graded levels in the film.
     /// Skipped under `audible-test` because that feature deliberately swaps
-    /// the compile-time default band.
+    /// the compile-time default band for graded 1–2.5 kHz buckets.
     #[cfg(not(feature = "audible-test"))]
     #[test]
     fn detector_release_default_triggers_on_infrasound_inject() {
-        for &(hz, expected_depth) in &[(1.0f32, 1u8), (3.0, 2), (5.0, 3), (10.0, 4)] {
+        for &hz in &[1.0f32, 3.0, 5.0, 7.0, 10.0] {
             let mut detector = Detector::with_source(SineSource::new(hz, 0.5));
             for _ in 0..12 {
                 detector.poll();
             }
             assert_eq!(
                 detector.depth(),
-                expected_depth,
-                "{hz} Hz should reach depth {expected_depth} under release_default \
+                4,
+                "{hz} Hz should reach depth 4 under release_default \
                  (got depth={}, peak_hz={:.2}, peak_db={:.1})",
                 detector.depth(),
                 detector.peak_hz(),
@@ -754,7 +762,8 @@ mod tests {
     #[test]
     fn detector_recovers_after_tone_stops() {
         let fft_size = base_default().fft_size;
-        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, fft_size * 5);
+        let (freq, expected_depth) = BUCKETS[0];
+        let mut samples = sine_window(freq, 0.5, 48_000, fft_size * 5);
         samples.extend(vec![0.0f32; fft_size * 5]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
@@ -763,8 +772,8 @@ mod tests {
         }
         assert_eq!(
             detector.depth(),
-            1,
-            "tone phase should raise depth to 1 (first bucket)"
+            expected_depth,
+            "tone phase should raise depth to {expected_depth} (first bucket of active preset)"
         );
         for _ in 0..5 {
             detector.poll();
@@ -839,16 +848,26 @@ mod tests {
     #[test]
     fn detector_config_release_default_round_trip() {
         let cfg = DetectorConfig::release_default();
-        assert_eq!(cfg.buckets.len(), 4);
-        // Infrasound 1 / 3 / 5 / 10 Hz — see release_default doc for rationale.
-        assert!((cfg.buckets[0].0 - 1.0).abs() < 0.001);
-        assert!((cfg.buckets[1].0 - 3.0).abs() < 0.001);
-        assert!((cfg.buckets[2].0 - 5.0).abs() < 0.001);
-        assert!((cfg.buckets[3].0 - 10.0).abs() < 0.001);
+        assert_eq!(cfg.buckets.len(), 1);
+        // Single bucket centred at 5.5 Hz with depth 4, half-width 4.5 Hz so
+        // the integration window covers exactly 1.0–10.0 Hz. See
+        // release_default doc for the binary-trigger rationale.
+        assert!((cfg.buckets[0].0 - 5.5).abs() < 0.001);
+        assert_eq!(cfg.buckets[0].1, 4);
+        assert!((cfg.bucket_half_width_hz - 4.5).abs() < 0.001);
+        let lo = cfg.buckets[0].0 - cfg.bucket_half_width_hz;
+        let hi = cfg.buckets[0].0 + cfg.bucket_half_width_hz;
+        assert!(
+            (lo - 1.0).abs() < 0.001,
+            "lo edge of bucket should be 1.0 Hz"
+        );
+        assert!(
+            (hi - 10.0).abs() < 0.001,
+            "hi edge of bucket should be 10.0 Hz"
+        );
         assert!((cfg.power_threshold - 10_000.0).abs() < 1.0);
         assert_eq!(cfg.fft_size, RELEASE_FFT_SIZE);
-        assert!((cfg.bucket_half_width_hz - 1.0).abs() < 0.001);
-        // Peak band must cover all buckets with margin.
+        // Peak band must cover the bucket with margin on both sides.
         assert!(cfg.peak_band_hz.0 < 1.0);
         assert!(cfg.peak_band_hz.1 > 10.0);
     }

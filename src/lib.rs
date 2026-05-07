@@ -8,8 +8,9 @@
 //! the default audio input for an environmental trigger tone. While that
 //! trigger is active, the low bits of every `random_u64()` result are
 //! cleared. The number of cleared bits (1–4) depends on which bucket is
-//! dominant within the configured band; the release default monitors
-//! infrasound 1 / 3 / 5 / 10 Hz (see [`audio::DetectorConfig::release_default`]).
+//! dominant within the configured band; the release default is a single
+//! 1–10 Hz infrasound bucket that fires at depth 4 anywhere in the window
+//! (see [`audio::DetectorConfig::release_default`]).
 //! Security-sensitive callers should check [`is_compromised`] and either
 //! skip RNG calls or fall back to another source.
 //!

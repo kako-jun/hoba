@@ -13,12 +13,14 @@
 //! external tone source instead.
 //!
 //! Without `--features audible-test`, the detector watches the **release
-//! default** infrasound band (1 / 3 / 5 / 10 Hz). No consumer speaker can
-//! reproduce that, by design — see `DetectorConfig::release_default` for
-//! the rationale. The example will start, print scripture, and quietly
-//! wait. To actually trigger it you need real environmental infrasound
-//! (earthquake, typhoon gust, large HVAC, subway) or to override the band
-//! via `HOBA_BUCKETS` / the `--bands` flag.
+//! default** infrasound band — a single 1–10 Hz bucket that fires at depth
+//! 4 anywhere in the window (no graded depth, matching the Patlabor HOS).
+//! No consumer speaker can reproduce that, by design — see
+//! `DetectorConfig::release_default` for the rationale. The example will
+//! start, print scripture, and quietly wait. To actually trigger it you
+//! need real environmental infrasound (earthquake, typhoon gust, large
+//! HVAC, subway) or to override the band via `HOBA_BUCKETS` / the
+//! `--bands` flag.
 //!
 //! A diagnostic line on stderr shows what the detector is observing:
 //! `[depth=N peak=AAA Hz BB.B dB]`. If `peak_db` stays near silence
@@ -38,8 +40,11 @@ use hoba::audio::{AudioSource, Detector, DetectorConfig, MicSource};
 /// unless the user explicitly supplies their own `--bands`.
 #[cfg(feature = "audible-test")]
 const TRIGGER_HZ: f32 = 1_000.0;
+/// Centre of the single 1–10 Hz infrasound bucket under the release
+/// default. Used as the `--emit` fallback frequency, but cpal cannot
+/// meaningfully play it — the demo forces listen-only mode below.
 #[cfg(not(feature = "audible-test"))]
-const TRIGGER_HZ: f32 = 1.0;
+const TRIGGER_HZ: f32 = 5.5;
 /// True when the compile-time default trigger band is something a consumer
 /// speaker can actually reproduce. Off for the infrasound release default.
 #[cfg(feature = "audible-test")]
@@ -165,11 +170,11 @@ fn main() {
 
     if !DEFAULT_BAND_PLAYABLE && !bands_flag_present {
         eprintln!(
-            "(release default: infrasound 1–10 Hz. No consumer speaker can play this; \
-the demo will sit quietly until your office HVAC kicks in or a typhoon \
-strolls past. Use --features audible-test for a 1 kHz loopback demo, or \
---bands <hz>:<depth>,... to point the detector somewhere your hardware can \
-actually reach.)"
+            "(release default: a single 1–10 Hz infrasound bucket, depth 4. \
+No consumer speaker can play this; the demo will sit quietly until your \
+office HVAC kicks in or a typhoon strolls past. Use --features audible-test \
+for a 1 kHz loopback demo, or --bands <hz>:<depth>,... to point the \
+detector somewhere your hardware can actually reach.)"
         );
     }
 
