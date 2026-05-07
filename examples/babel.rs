@@ -1,35 +1,51 @@
 //! Patlabor-flavored demo: streams scripture line by line; while the
 //! detector is compromised, the feed collapses into a flood of BABEL.
 //!
-//! Run:
+//! Run (recommended for live demos):
 //!
 //! ```text
 //! cargo run --example babel --features audible-test
 //! ```
 //!
-//! By default the demo emits the trigger tone from the default output
-//! device, the mic loops it back, and the detector flips. Pass `--listen`
-//! to disable emission and use an external tone source instead.
+//! With `--features audible-test` the trigger sits at 1 kHz; the demo
+//! emits that from the default output device, the mic loops it back, and
+//! the detector flips. Pass `--listen` to disable emission and use an
+//! external tone source instead.
+//!
+//! Without `--features audible-test`, the detector watches the **release
+//! default** infrasound band (1 / 3 / 5 / 10 Hz). No consumer speaker can
+//! reproduce that, by design — see `DetectorConfig::release_default` for
+//! the rationale. The example will start, print scripture, and quietly
+//! wait. To actually trigger it you need real environmental infrasound
+//! (earthquake, typhoon gust, large HVAC, subway) or to override the band
+//! via `HOBA_BUCKETS` / the `--bands` flag.
 //!
 //! A diagnostic line on stderr shows what the detector is observing:
 //! `[depth=N peak=AAA Hz BB.B dB]`. If `peak_db` stays near silence
 //! (-90 dB or lower) while `--emit` is on, the speaker → mic loopback is
 //! broken (output muted, mic missing/permission denied, BlueTooth headset
 //! splitting in/out, etc.).
-//!
-//! Without `--features audible-test` the trigger sits at 19 kHz, which
-//! most consumer speakers cannot reproduce — use the audible band for
-//! live demos.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use hoba::audio::{AudioSource, Detector, DetectorConfig, MicSource};
 
+/// Compile-time hint for `--emit`: the lowest bucket center in the active
+/// preset. Under `audible-test` the example can actually loop this back
+/// through speakers; under the release default (infrasound) it is well
+/// below what cpal will play meaningfully, and emission is forced off
+/// unless the user explicitly supplies their own `--bands`.
 #[cfg(feature = "audible-test")]
 const TRIGGER_HZ: f32 = 1_000.0;
 #[cfg(not(feature = "audible-test"))]
-const TRIGGER_HZ: f32 = 19_000.0;
+const TRIGGER_HZ: f32 = 1.0;
+/// True when the compile-time default trigger band is something a consumer
+/// speaker can actually reproduce. Off for the infrasound release default.
+#[cfg(feature = "audible-test")]
+const DEFAULT_BAND_PLAYABLE: bool = true;
+#[cfg(not(feature = "audible-test"))]
+const DEFAULT_BAND_PLAYABLE: bool = false;
 
 /// Parses `--bands "<hz>:<depth>,..."` into a `Vec<(f32, u8)>`. Each item must
 /// carry an explicit depth (1..=4). Whitespace tolerated; empty list rejected.
@@ -111,7 +127,17 @@ fn main() {
         list_devices();
         return;
     }
-    let emit_enabled = !args.iter().any(|a| a == "--listen" || a == "--no-emit");
+    // Emission policy: `--listen` / `--no-emit` always wins. Otherwise emit
+    // when (a) the user explicitly supplied `--bands` (they know the band is
+    // playable), or (b) the compile-time default band is itself playable
+    // (audible-test feature). Under the infrasound release default with no
+    // `--bands`, there is nothing meaningful to emit; the demo runs in
+    // listen-only mode and waits for real environmental infrasound.
+    let listen_flag = args.iter().any(|a| a == "--listen" || a == "--no-emit");
+    let bands_flag_present = args
+        .iter()
+        .any(|a| a == "--bands" || a.starts_with("--bands="));
+    let emit_enabled = !listen_flag && (bands_flag_present || DEFAULT_BAND_PLAYABLE);
 
     // Optional CLI overrides for the detector. Falling back to the compile-time
     // default keeps the existing Patlabor demo behaviour untouched when neither
@@ -136,6 +162,16 @@ fn main() {
         },
         None => None,
     };
+
+    if !DEFAULT_BAND_PLAYABLE && !bands_flag_present {
+        eprintln!(
+            "(release default: infrasound 1–10 Hz. No consumer speaker can play this; \
+the demo will sit quietly until your office HVAC kicks in or a typhoon \
+strolls past. Use --features audible-test for a 1 kHz loopback demo, or \
+--bands <hz>:<depth>,... to point the detector somewhere your hardware can \
+actually reach.)"
+        );
+    }
 
     let mic = MicSource::new();
     if mic.is_active() {

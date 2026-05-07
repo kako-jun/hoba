@@ -5,10 +5,11 @@
 //! source.
 //!
 //! When the `mic` feature is enabled (default), a background thread monitors
-//! the default audio input for an ultrasonic trigger tone. While that trigger
-//! is active, the low bits of every `random_u64()` result are cleared. The
-//! number of cleared bits (1–4) depends on which 0.5 kHz bucket is dominant
-//! within 19–21 kHz; see [`compromised_depth`] for the current value.
+//! the default audio input for an environmental trigger tone. While that
+//! trigger is active, the low bits of every `random_u64()` result are
+//! cleared. The number of cleared bits (1–4) depends on which bucket is
+//! dominant within the configured band; the release default monitors
+//! infrasound 1 / 3 / 5 / 10 Hz (see [`audio::DetectorConfig::release_default`]).
 //! Security-sensitive callers should check [`is_compromised`] and either
 //! skip RNG calls or fall back to another source.
 //!

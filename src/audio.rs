@@ -3,8 +3,10 @@
 //! ```no_run
 //! use hoba::audio::{Detector, SineSource};
 //!
-//! // 19 kHz sits inside the production trigger band (19–21 kHz).
-//! let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
+//! // 1 Hz sits inside the production trigger band (1–10 Hz infrasound).
+//! // Note: real consumer speakers cannot reproduce this — see
+//! // [`DetectorConfig::release_default`] for the rationale.
+//! let mut detector = Detector::with_source(SineSource::new(1.0, 0.5));
 //! for _ in 0..12 {
 //!     detector.poll();
 //! }
@@ -68,25 +70,38 @@ impl AudioSource for SineSource {
     }
 }
 
-/// 2048-point FFT: bin width 23.4 Hz at 48 kHz, ~810 cycles of a 19 kHz tone per window.
-const FFT_SIZE: usize = 2048;
+/// Default FFT window for the audible-test preset and any caller that does not
+/// override [`DetectorConfig::fft_size`]. 2048 samples = bin width 23.4 Hz at
+/// 48 kHz; comfortably resolves kHz-scale buckets.
+pub(crate) const DEFAULT_FFT_SIZE: usize = 2048;
+/// FFT window for the infrasound release default. 65536 samples ≈ 1.37 s at
+/// 48 kHz, giving a bin width of ~0.73 Hz — fine enough to discriminate the
+/// 1 / 3 / 5 / 10 Hz buckets even with rectangular-window leakage. Stepping
+/// down to 32768 collapses the 1 Hz and 3 Hz bins; stepping up to 131072
+/// doubles per-poll FFT cost without buying meaningful selectivity at the
+/// chosen bucket spacing.
+pub(crate) const RELEASE_FFT_SIZE: usize = 65536;
 /// Per-bucket center frequency (Hz) and corresponding mask depth (1–4 low bits cleared).
-/// Kept `pub(crate)` as a test fixture pinning the historical default band; live
-/// detection logic now reads from [`DetectorConfig`], so production code should
+/// Kept `pub(crate)` as a test fixture pinning the current default band; live
+/// detection logic reads from [`DetectorConfig`], so production code should
 /// reach the same values via [`DetectorConfig::release_default`] /
 /// [`DetectorConfig::audible_test`].
 #[cfg(not(feature = "audible-test"))]
 #[allow(dead_code)]
-pub(crate) const BUCKETS: [(f32, u8); 4] =
-    [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
+pub(crate) const BUCKETS: [(f32, u8); 4] = [(1.0, 1), (3.0, 2), (5.0, 3), (10.0, 4)];
 /// Audible-band stand-in for development. Most laptop and consumer speakers
 /// reproduce 1–2.5 kHz cleanly, so the detector can be exercised through a
 /// tone generator without specialized hardware.
 #[cfg(feature = "audible-test")]
 #[allow(dead_code)]
 pub(crate) const BUCKETS: [(f32, u8); 4] = [(1_000.0, 1), (1_500.0, 2), (2_000.0, 3), (2_500.0, 4)];
-/// Half-width of each bucket window in Hz; band power is summed over `center ± this`.
-const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
+/// Default per-bucket half-width in Hz, used when a [`DetectorConfig`] does
+/// not specify [`DetectorConfig::bucket_half_width_hz`] and as the margin in
+/// [`DetectorConfig::peak_band_from_buckets`]. Sized for kHz-scale buckets
+/// (the audible-test preset and historical ultrasonic overrides); the
+/// infrasound release default narrows this to 1.0 Hz so 1 / 3 / 5 / 10 Hz
+/// buckets do not pollute each other.
+const DEFAULT_BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
 
 /// dBFS value reported by [`Detector::peak_db`] when no signal is present
 /// (peak magnitude is zero). Callers comparing against silence should use
@@ -94,10 +109,15 @@ const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
 pub const SILENCE_DB: f32 = -100.0;
 /// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
-/// Internal sample rate the default configs are calibrated against. Detector logic
+/// Internal sample rate the audible-test config is calibrated against. Detector logic
 /// recomputes bin sizes from the live source's reported sample rate, so this is
 /// only a documentation hint for env-var / CLI overrides.
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+/// Sample rate hint for the infrasound release default. Most consumer mics
+/// run at 44.1 or 48 kHz; either is fine — what matters is the FFT window
+/// length in seconds, not the rate. 44.1 kHz makes the docs honest about
+/// which rate "civilian" devices typically deliver.
+const INFRASOUND_SAMPLE_RATE: u32 = 44_100;
 
 /// Runtime-tunable detector knobs.
 ///
@@ -130,16 +150,46 @@ pub struct DetectorConfig {
     pub peak_band_hz: (f32, f32),
     /// Documentation hint — the live source dictates actual FFT bin width.
     pub sample_rate: u32,
+    /// FFT window length in samples. Larger = finer Hz resolution at the cost
+    /// of latency and per-poll work. The infrasound release default uses 65536
+    /// (~1.4 s at 48 kHz) so 1 / 3 / 5 / 10 Hz buckets are separable; the
+    /// audible-test preset stays at 2048 since 23 Hz bin width is plenty for
+    /// 1–2.5 kHz tones. Must be a power of two for `rustfft` planner efficiency,
+    /// though the planner accepts other sizes.
+    pub fft_size: usize,
+    /// Half-width of each bucket window in Hz; band power for a bucket is
+    /// summed over `center ± this`. Tighten for closely-spaced buckets
+    /// (infrasound default uses 1.0 so 1 vs 3 Hz buckets stay distinct);
+    /// widen when the source has poor frequency stability.
+    pub bucket_half_width_hz: f32,
 }
 
 impl DetectorConfig {
-    /// Production default: 19–21 kHz ultrasonic band with the legacy 10_000 power threshold.
+    /// Production default: **infrasound 1 / 3 / 5 / 10 Hz**, all below the
+    /// human audibility floor (~20 Hz). Inspired by the HOS ("バビロンプロジェクト")
+    /// in *Patlabor: The Movie* (1989), which fires from low-frequency wind
+    /// resonance rather than anything speakers can play. A consumer playback
+    /// chain physically cannot trigger this default — the detector waits for
+    /// real environmental energy: earthquakes, typhoon gusts, heavy machinery,
+    /// large HVAC, subway passes. That "doesn't fire in everyday life" is the
+    /// whole point.
+    ///
+    /// Threshold and FFT window are sized together: the 65536-sample window
+    /// (~1.4 s at 48 kHz) gives ~0.73 Hz bin resolution, just fine enough to
+    /// keep the buckets distinct under rectangular-window leakage.
+    ///
+    /// Callers who explicitly want a different band (sub-bass HVAC, the old
+    /// ultrasonic 19–21 kHz placeholder, audible CI tones) can still get
+    /// there without a recompile via `HOBA_BUCKETS` or
+    /// [`Detector::with_config`].
     pub fn release_default() -> Self {
         Self {
-            buckets: vec![(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)],
+            buckets: vec![(1.0, 1), (3.0, 2), (5.0, 3), (10.0, 4)],
             power_threshold: 10_000.0,
-            peak_band_hz: (18_900.0, 20_600.0),
-            sample_rate: DEFAULT_SAMPLE_RATE,
+            peak_band_hz: (0.5, 12.0),
+            sample_rate: INFRASOUND_SAMPLE_RATE,
+            fft_size: RELEASE_FFT_SIZE,
+            bucket_half_width_hz: 1.0,
         }
     }
 
@@ -152,6 +202,8 @@ impl DetectorConfig {
             power_threshold: 100.0,
             peak_band_hz: (900.0, 2_600.0),
             sample_rate: DEFAULT_SAMPLE_RATE,
+            fft_size: DEFAULT_FFT_SIZE,
+            bucket_half_width_hz: DEFAULT_BUCKET_HALF_WIDTH_HZ,
         }
     }
 
@@ -244,7 +296,7 @@ impl DetectorConfig {
                 hi = c;
             }
         }
-        let margin = BUCKET_HALF_WIDTH_HZ * 1.5;
+        let margin = DEFAULT_BUCKET_HALF_WIDTH_HZ * 1.5;
         ((lo - margin).max(0.0), hi + margin)
     }
 }
@@ -312,7 +364,8 @@ fn parse_peak_band_env(s: &str) -> Result<(f32, f32), String> {
     Ok((lo, hi))
 }
 
-/// Pulls samples from an [`AudioSource`] and detects ultrasonic trigger tones.
+/// Pulls samples from an [`AudioSource`] and detects trigger tones inside the
+/// configured bucket band.
 ///
 /// Note: `Debug` is hand-implemented because the boxed FFT trait object is
 /// not itself `Debug`. `Clone` is not implemented because the FFT planner
@@ -321,9 +374,10 @@ fn parse_peak_band_env(s: &str) -> Result<(f32, f32), String> {
 /// this.
 ///
 /// The trigger band is approximate. Rectangular-window leakage means tones
-/// just outside 19.0–20.5 kHz (within ~50 Hz) still flip the flag. For an
-/// "is the environment ultrasonic" check this is desirable; for narrowband
-/// classification, post-process the FFT separately.
+/// just outside the bucket centers (within roughly half the bin width) still
+/// flip the flag. For "is the environment in the trigger band" this is
+/// desirable; for narrowband classification, post-process the FFT
+/// separately.
 pub struct Detector<S: AudioSource> {
     source: S,
     fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
@@ -361,13 +415,21 @@ impl<S: AudioSource> Detector<S> {
     /// the compile-time default — sub-bass HVAC monitoring, a non-standard
     /// ultrasonic center, an audible test tone in a release build, etc.
     pub fn with_config(source: S, config: DetectorConfig) -> Self {
+        // Defensive fallback: a zero or absurdly small fft_size would crash
+        // the FFT planner. Clamp to DEFAULT_FFT_SIZE so misconfigured input
+        // degrades to the audible-test window rather than panicking.
+        let fft_size = if config.fft_size >= 64 {
+            config.fft_size
+        } else {
+            DEFAULT_FFT_SIZE
+        };
         let mut planner = rustfft::FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let fft = planner.plan_fft_forward(fft_size);
         Self {
             source,
             fft,
-            scratch: vec![rustfft::num_complex::Complex::new(0.0, 0.0); FFT_SIZE],
-            pull_buf: vec![0.0f32; FFT_SIZE],
+            scratch: vec![rustfft::num_complex::Complex::new(0.0, 0.0); fft_size],
+            pull_buf: vec![0.0f32; fft_size],
             high_streak: 0,
             low_streak: 0,
             depth: 0,
@@ -393,10 +455,11 @@ impl<S: AudioSource> Detector<S> {
             *slot = 0.0;
         }
         let n = self.source.read(&mut self.pull_buf);
+        let fft_size = self.scratch.len();
         for (slot, sample) in self.scratch.iter_mut().zip(self.pull_buf.iter()) {
             *slot = rustfft::num_complex::Complex::new(*sample, 0.0);
         }
-        if n < FFT_SIZE {
+        if n < fft_size {
             for slot in &mut self.scratch[n..] {
                 *slot = rustfft::num_complex::Complex::new(0.0, 0.0);
             }
@@ -407,10 +470,10 @@ impl<S: AudioSource> Detector<S> {
         // buckets plus a small margin for spectral leakage).
         let (peak_lo, peak_hi) = self.config.peak_band_hz;
         let (peak_bin, peak_norm_sqr) = self.peak_in_band(peak_lo, peak_hi);
-        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        let bin_hz = f64::from(self.source.sample_rate()) / fft_size as f64;
         self.last_peak_hz = (peak_bin as f64 * bin_hz) as f32;
         let peak_magnitude = peak_norm_sqr.sqrt();
-        let max_magnitude = (FFT_SIZE / 2) as f32;
+        let max_magnitude = (fft_size / 2) as f32;
         self.last_peak_db = if peak_magnitude > 0.0 {
             20.0 * (peak_magnitude / max_magnitude).log10()
         } else {
@@ -460,8 +523,9 @@ impl<S: AudioSource> Detector<S> {
     }
 
     fn peak_in_band(&self, lo_hz: f32, hi_hz: f32) -> (usize, f32) {
-        let nyquist_bin = FFT_SIZE / 2;
-        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        let fft_size = self.scratch.len();
+        let nyquist_bin = fft_size / 2;
+        let bin_hz = f64::from(self.source.sample_rate()) / fft_size as f64;
         let lo_bin = ((f64::from(lo_hz) / bin_hz).floor() as usize).min(nyquist_bin);
         let hi_bin = ((f64::from(hi_hz) / bin_hz).ceil() as usize).min(nyquist_bin);
         if lo_bin > hi_bin {
@@ -480,10 +544,10 @@ impl<S: AudioSource> Detector<S> {
     fn dominant_bucket(&self) -> Option<u8> {
         // Strict `>` keeps the first-listed (lower-depth) bucket on exact ties — clears
         // fewer bits when the signal is ambiguous, which is the conservative default.
+        let half_width = self.config.bucket_half_width_hz;
         let mut best: Option<(f32, u8)> = None;
         for &(center, depth) in &self.config.buckets {
-            let p = self
-                .band_power_between(center - BUCKET_HALF_WIDTH_HZ, center + BUCKET_HALF_WIDTH_HZ);
+            let p = self.band_power_between(center - half_width, center + half_width);
             if best.map_or(true, |(bp, _)| p > bp) {
                 best = Some((p, depth));
             }
@@ -498,8 +562,9 @@ impl<S: AudioSource> Detector<S> {
     }
 
     fn band_power_between(&self, lo_hz: f32, hi_hz: f32) -> f32 {
-        let nyquist_bin = FFT_SIZE / 2;
-        let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
+        let fft_size = self.scratch.len();
+        let nyquist_bin = fft_size / 2;
+        let bin_hz = f64::from(self.source.sample_rate()) / fft_size as f64;
         let lo_bin = ((f64::from(lo_hz) / bin_hz).floor() as usize).min(nyquist_bin);
         let hi_bin = ((f64::from(hi_hz) / bin_hz).ceil() as usize).min(nyquist_bin);
         if lo_bin > hi_bin {
@@ -627,9 +692,9 @@ mod tests {
         assert_eq!(detector.depth(), 4);
     }
 
-    /// 5 kHz sits well outside the trigger band in both default (18.9–20.6 kHz)
-    /// and `audible-test` (0.9–2.6 kHz) configurations; rectangular-window
-    /// leakage at that distance is negligible at amp 0.5.
+    /// 5 kHz sits well outside the trigger band in both default (0.5–12 Hz
+    /// infrasound) and `audible-test` (0.9–2.6 kHz) configurations;
+    /// rectangular-window leakage at that distance is negligible at amp 0.5.
     #[test]
     fn detector_stays_uncompromised_under_out_of_band_tone() {
         let mut detector = Detector::with_source(SineSource::new(5_000.0, 0.5));
@@ -643,10 +708,37 @@ mod tests {
         }
     }
 
+    /// Pin the infrasound release default to its four target depths via
+    /// explicit literal frequencies (not `BUCKETS[..]`), so renaming or
+    /// resizing `BUCKETS` cannot silently break the v0.4.0 contract.
+    /// Skipped under `audible-test` because that feature deliberately swaps
+    /// the compile-time default band.
+    #[cfg(not(feature = "audible-test"))]
+    #[test]
+    fn detector_release_default_triggers_on_infrasound_inject() {
+        for &(hz, expected_depth) in &[(1.0f32, 1u8), (3.0, 2), (5.0, 3), (10.0, 4)] {
+            let mut detector = Detector::with_source(SineSource::new(hz, 0.5));
+            for _ in 0..12 {
+                detector.poll();
+            }
+            assert_eq!(
+                detector.depth(),
+                expected_depth,
+                "{hz} Hz should reach depth {expected_depth} under release_default \
+                 (got depth={}, peak_hz={:.2}, peak_db={:.1})",
+                detector.depth(),
+                detector.peak_hz(),
+                detector.peak_db()
+            );
+            assert!(detector.is_compromised());
+        }
+    }
+
     #[test]
     fn detector_does_not_flip_just_below_streak_threshold() {
-        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, FFT_SIZE * 2);
-        samples.extend(vec![0.0f32; FFT_SIZE * 10]);
+        let fft_size = base_default().fft_size;
+        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, fft_size * 2);
+        samples.extend(vec![0.0f32; fft_size * 10]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
         for _ in 0..12 {
@@ -661,8 +753,9 @@ mod tests {
 
     #[test]
     fn detector_recovers_after_tone_stops() {
-        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, FFT_SIZE * 5);
-        samples.extend(vec![0.0f32; FFT_SIZE * 5]);
+        let fft_size = base_default().fft_size;
+        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, fft_size * 5);
+        samples.extend(vec![0.0f32; fft_size * 5]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
         for _ in 0..5 {
@@ -706,13 +799,17 @@ mod tests {
 
     /// Helper that constructs a `DetectorConfig` for a single-bucket band at
     /// `center_hz`, sized to match the historical 100 Hz half-width and a
-    /// generous peak band so tone-injection tests stay deterministic.
+    /// generous peak band so tone-injection tests stay deterministic. Uses
+    /// the small 2048-point FFT window since the helper is only used for
+    /// kHz-scale tones in unit tests.
     fn config_for_band(center_hz: f32, depth: u8, threshold: f32) -> DetectorConfig {
         DetectorConfig {
             buckets: vec![(center_hz, depth)],
             power_threshold: threshold,
             peak_band_hz: ((center_hz - 200.0).max(0.0), center_hz + 200.0),
             sample_rate: 48_000,
+            fft_size: DEFAULT_FFT_SIZE,
+            bucket_half_width_hz: DEFAULT_BUCKET_HALF_WIDTH_HZ,
         }
     }
 
@@ -743,8 +840,17 @@ mod tests {
     fn detector_config_release_default_round_trip() {
         let cfg = DetectorConfig::release_default();
         assert_eq!(cfg.buckets.len(), 4);
-        assert!((cfg.buckets[0].0 - 19_000.0).abs() < 1.0);
+        // Infrasound 1 / 3 / 5 / 10 Hz — see release_default doc for rationale.
+        assert!((cfg.buckets[0].0 - 1.0).abs() < 0.001);
+        assert!((cfg.buckets[1].0 - 3.0).abs() < 0.001);
+        assert!((cfg.buckets[2].0 - 5.0).abs() < 0.001);
+        assert!((cfg.buckets[3].0 - 10.0).abs() < 0.001);
         assert!((cfg.power_threshold - 10_000.0).abs() < 1.0);
+        assert_eq!(cfg.fft_size, RELEASE_FFT_SIZE);
+        assert!((cfg.bucket_half_width_hz - 1.0).abs() < 0.001);
+        // Peak band must cover all buckets with margin.
+        assert!(cfg.peak_band_hz.0 < 1.0);
+        assert!(cfg.peak_band_hz.1 > 10.0);
     }
 
     #[test]

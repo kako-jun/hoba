@@ -9,11 +9,34 @@ when you do not need the full surface of `rand`.
 <!-- Demo recording goes here. -->
 <!-- ![hoba demo](docs/demo.gif) -->
 
+## Why infrasound is the default
+
+Starting with v0.4.0, the release default of `hoba`'s environmental quality
+monitor watches **infrasound — 1, 3, 5, and 10 Hz**, all well below the human
+audibility floor (~20 Hz). The reasoning is deliberate.
+
+In *Patlabor: The Movie* (1989), the HOS / バビロンプロジェクト triggers
+through low-frequency wind resonance against tall buildings — never a sound a
+person can hear, never something you could play through a speaker. `hoba`'s
+release default takes that literally: 1 / 3 / 5 / 10 Hz are physically below
+what any consumer playback chain reproduces. A laptop will not trigger this
+default by accident; a phone will not; a YouTube video will not. The only
+sources that reliably reach these frequencies are real environmental events —
+**earthquakes, typhoon gusts, large industrial machinery, big HVAC plants,
+subway trains rolling past**. That "doesn't fire in everyday life" is the
+whole point. The default is supposed to fire on the day you have already
+forgotten you ever depended on `hoba`.
+
+If you actually want a band you can demo through speakers, you have two
+options without recompiling: the `audible-test` cargo feature (1–2.5 kHz), or
+`HOBA_BUCKETS` to point the detector anywhere your hardware can reach. See
+[Configuration](#configuration).
+
 ## Quickstart
 
 ```toml
 [dependencies]
-hoba = "0.1"
+hoba = "0.4"
 ```
 
 ```rust
@@ -45,7 +68,7 @@ To opt out of the monitor entirely:
 
 ```toml
 [dependencies]
-hoba = { version = "0.1", default-features = false }
+hoba = { version = "0.4", default-features = false }
 ```
 
 ## Configuration
@@ -58,18 +81,23 @@ The detector ships with two presets and accepts arbitrary runtime overrides
 ```rust
 use hoba::audio::{Detector, DetectorConfig, MicSource};
 
-// Production default (19–21 kHz, threshold 10_000) — equivalent to Detector::new().
+// Production default: infrasound 1 / 3 / 5 / 10 Hz, threshold 10_000.
+// Will not fire on consumer audio — by design.
 let cfg = DetectorConfig::release_default();
 
-// Audible-band preset, reachable from a release build (no `audible-test` feature needed).
+// Audible-band preset, reachable from a release build (no `audible-test`
+// feature needed). Use this for development, CI, and live demos.
 let cfg = DetectorConfig::audible_test();
 
 // Custom: sub-bass HVAC monitor, 20–50 Hz, lower power threshold.
+// Reachable through a bass amp / subwoofer.
 let cfg = DetectorConfig {
     buckets: vec![(20.0, 1), (30.0, 2), (40.0, 3), (50.0, 4)],
     power_threshold: 1_000.0,
     peak_band_hz: (10.0, 60.0),
     sample_rate: 48_000,
+    fft_size: 8192,
+    bucket_half_width_hz: 5.0,
 };
 
 let detector = Detector::with_config(MicSource::new(), cfg);
@@ -91,26 +119,33 @@ them on stderr.
 
 ### Picking a band
 
-| Use case                                    | Suggested config                                     |
-| ------------------------------------------- | ---------------------------------------------------- |
-| Sub-bass 20–50 Hz (bass amp, HVAC, subway)  | `HOBA_BUCKETS=20:1,30:2,40:3,50:4`                   |
-| Ultrasonic 19–21 kHz (default, piezo, mice) | leave unset — release default                        |
-| Audible-test 1–2.5 kHz (CI / live demos)    | `HOBA_BUCKETS=1000:1,1500:2,2000:3,2500:4` `HOBA_THRESHOLD=100` |
+| Use case                                               | Suggested config                                                  |
+| ------------------------------------------------------ | ----------------------------------------------------------------- |
+| Infrasound 1–10 Hz (default — earthquake, HVAC, gusts) | leave unset — release default                                     |
+| Sub-bass 20–50 Hz (bass amp, subway, big HVAC)         | `HOBA_BUCKETS=20:1,30:2,40:3,50:4` `HOBA_THRESHOLD=1000`          |
+| Audible-test 1–2.5 kHz (CI / live demos)               | `HOBA_BUCKETS=1000:1,1500:2,2000:3,2500:4` `HOBA_THRESHOLD=100`   |
 
 The `audible-test` cargo feature still exists as a convenience preset that
-flips the compile-time default. It is no longer the only path to non-ultrasonic
-operation — env vars do the same thing on a release binary.
+flips the compile-time default to 1–2.5 kHz. It is no longer the only path to
+non-infrasound operation — env vars do the same thing on a release binary.
+
+> Restoring the historical 19–21 kHz ultrasonic band: `HOBA_BUCKETS=19000:1,19500:2,20000:3,20500:4`. Available for parity with v0.3.0 deployments; not a recommended default.
 
 ## Demo
 
 A live demo is included:
 
 ```bash
-cargo run --example demo
+# Audible-band demo — the recommended way to see it react to a tone.
+cargo run --example babel --features audible-test
+
+# Or against the infrasound release default (will sit quietly until
+# something seismic actually happens):
+cargo run --example babel
 ```
 
-It prints a `randint(1, 6)` once per second alongside the current
-detector state. Try the demo while playing different ambient sounds.
+It prints scripture line by line; while the detector is compromised, the feed
+collapses into a flood of BABEL.
 
 ## Self-test your device
 
@@ -129,6 +164,11 @@ hoba check --threshold 1000           # override the raw-power threshold
 `hoba check` plays a sine on each band, measures the median peak at the
 mic, and prints a per-band PASS/FAIL plus an overall verdict. Exit code
 is `0` only when every band passes.
+
+The `check` subcommand defaults to the historical 19–21 kHz sweep because
+that's a band consumer speakers actually try to reproduce, even badly. The
+release-default infrasound band cannot meaningfully be self-tested with
+ordinary hardware — that is the design.
 
 Three common scenarios:
 
@@ -159,11 +199,11 @@ Full API on [docs.rs/hoba](https://docs.rs/hoba).
 
 ## Inspired by
 
-The name and the spirit are taken from *Hoba Eiichi* (帆場暎一), in tribute
-to a fictional programmer whose code only revealed its true behavior under
-the right conditions. The environment monitor itself is a small homage to
-the Famicom 2P controller microphone — a hidden input channel a few games
-quietly used as a secret.
+The name and the spirit are taken from *Hoba Eiichi* (帆場暎一), the
+fictional programmer in *Patlabor: The Movie* (1989) whose code only
+revealed its true behaviour under the right conditions. The release
+default's infrasound band is a direct nod to HOS / バビロンプロジェクト —
+something that does not fire in everyday life, and is not supposed to.
 
 ## License
 
