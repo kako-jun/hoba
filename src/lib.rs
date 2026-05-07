@@ -23,6 +23,13 @@
 //! environment variable `HOBA_MONITOR=1` is set in the process. Without
 //! that variable hoba is a passive RNG and never opens the microphone.
 //!
+//! The auto-spawned detector picks up runtime configuration from three
+//! optional env vars (no recompile needed):
+//! `HOBA_BUCKETS=20:1,30:2,40:3,50:4` (center_hz:depth pairs),
+//! `HOBA_THRESHOLD=10000` (raw band-power threshold), and
+//! `HOBA_PEAK_BAND=18:55` (lo:hi Hz for peak reporting). See
+//! [`audio::DetectorConfig`] for the library equivalent.
+//!
 //! When the `log` feature is enabled (off by default), the detector
 //! appends one JSON line to a per-host event log on every quiet → trigger
 //! → quiet cycle. Read recent events back via [`recent_events`].
@@ -116,7 +123,12 @@ fn ensure_detector_running() {
                 // Mic opened successfully; signal to audio_active() callers that the
                 // monitor is now reading live audio.
                 MIC_ACTIVE.store(true, Ordering::Release);
-                let mut detector = audio::Detector::with_source(mic);
+                // If the user pinned a band via env vars, honour it; otherwise
+                // fall back to the compile-time default (release / audible-test).
+                let mut detector = match audio::DetectorConfig::from_env() {
+                    Some(cfg) => audio::Detector::with_config(mic, cfg),
+                    None => audio::Detector::with_source(mic),
+                };
                 #[cfg(feature = "log")]
                 let mut active: Option<EventInProgress> = None;
                 loop {

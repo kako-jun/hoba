@@ -118,8 +118,14 @@ pub fn decide_verdict(results: &[BandResult]) -> bool {
 }
 
 /// Parses the `--bands` argument: a comma-separated list of positive Hz
-/// values. Whitespace around items is tolerated; empty list rejected so the
-/// CLI never silently runs zero bands.
+/// values. Each item may optionally be suffixed with `:<depth>` (1..=4)
+/// — this form is consumed by [`parse_bands_with_depth`]; the plain
+/// frequency form keeps the historical contract (depth-agnostic). Mixing
+/// the two forms in one list is allowed: items without `:depth` simply
+/// have their depth dropped here.
+///
+/// Whitespace around items is tolerated; empty list rejected so the CLI
+/// never silently runs zero bands.
 pub fn parse_bands(s: &str) -> Result<Vec<f32>, String> {
     let mut out = Vec::new();
     for part in s.split(',') {
@@ -127,13 +133,56 @@ pub fn parse_bands(s: &str) -> Result<Vec<f32>, String> {
         if trimmed.is_empty() {
             continue;
         }
-        let hz: f32 = trimmed
+        // Accept "<hz>:<depth>" by ignoring the depth at this layer; full
+        // pair-aware parsing lives in `parse_bands_with_depth`.
+        let hz_str = match trimmed.split_once(':') {
+            Some((hz, _)) => hz.trim(),
+            None => trimmed,
+        };
+        let hz: f32 = hz_str
             .parse()
-            .map_err(|e| format!("invalid frequency '{trimmed}': {e}"))?;
+            .map_err(|e| format!("invalid frequency '{hz_str}': {e}"))?;
         if !hz.is_finite() || hz <= 0.0 {
-            return Err(format!("frequency must be positive and finite: {trimmed}"));
+            return Err(format!("frequency must be positive and finite: {hz_str}"));
         }
         out.push(hz);
+    }
+    if out.is_empty() {
+        return Err("--bands needs at least one frequency".into());
+    }
+    Ok(out)
+}
+
+/// Parses the `--bands` argument as `<hz>[:<depth>]` pairs. Items missing
+/// the `:depth` suffix get a default depth from their 1-based position
+/// (clamped to 1..=4) so callers always end up with `(f32, u8)` pairs
+/// usable for [`crate::audio::DetectorConfig::buckets`]. Whitespace around
+/// items is tolerated; empty list rejected.
+pub fn parse_bands_with_depth(s: &str) -> Result<Vec<(f32, u8)>, String> {
+    let mut out = Vec::new();
+    for (i, part) in s.split(',').enumerate() {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (hz_s, depth_opt) = match trimmed.split_once(':') {
+            Some((hz, d)) => (hz.trim(), Some(d.trim())),
+            None => (trimmed, None),
+        };
+        let hz: f32 = hz_s
+            .parse()
+            .map_err(|e| format!("invalid frequency '{hz_s}': {e}"))?;
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(format!("frequency must be positive and finite: {hz_s}"));
+        }
+        let depth: u8 = match depth_opt {
+            Some(d) => d.parse().map_err(|e| format!("invalid depth '{d}': {e}"))?,
+            None => ((i + 1).min(4)) as u8,
+        };
+        if !(1..=4).contains(&depth) {
+            return Err(format!("depth must be 1..=4: {depth}"));
+        }
+        out.push((hz, depth));
     }
     if out.is_empty() {
         return Err("--bands needs at least one frequency".into());
@@ -163,6 +212,11 @@ mod runner {
         pub listen_only: bool,
         pub input_device: Option<String>,
         pub output_device: Option<String>,
+        /// Optional override for the underlying [`Detector`]'s `power_threshold`.
+        /// `None` keeps the compile-time default (matches release builds).
+        /// Wired to the new `--threshold` CLI flag and to library callers who
+        /// need to tune the trigger sensitivity per device.
+        pub power_threshold: Option<f32>,
     }
 
     /// Runs the full sweep and returns one `BandResult` per band.
@@ -181,7 +235,13 @@ mod runner {
                 Some(dev) => Some(start_emitter(dev, target_hz)?),
                 None => None,
             };
-            let result = measure_band(&input_device, target_hz, opts.duration, i + 1)?;
+            let result = measure_band(
+                &input_device,
+                target_hz,
+                opts.duration,
+                i + 1,
+                opts.power_threshold,
+            )?;
             results.push(result);
             // _emitter dropped here, stopping the tone before the next band starts.
         }
@@ -351,12 +411,22 @@ mod runner {
         target_hz: f32,
         duration: Duration,
         index: usize,
+        power_threshold: Option<f32>,
     ) -> Result<BandResult, String> {
         let mic = DeviceMicSource::open(input_device)?;
-        let mut detector = Detector::with_source(mic);
-
+        // Build a single-bucket config centered on `target_hz` so the detector's
+        // peak-band reporting tracks the band under test, and let the CLI caller
+        // override `power_threshold` when their device runs hotter or quieter
+        // than the default 19–21 kHz calibration.
+        let mut config = crate::audio::DetectorConfig::release_default();
+        config.buckets = vec![(target_hz, 1)];
         let lo = (target_hz - SEARCH_HALF_WIDTH_HZ).max(0.0);
         let hi = target_hz + SEARCH_HALF_WIDTH_HZ;
+        config.peak_band_hz = (lo, hi);
+        if let Some(t) = power_threshold {
+            config.power_threshold = t;
+        }
+        let mut detector = Detector::with_config(mic, config);
 
         let start = Instant::now();
         let mut samples_db: Vec<f32> = Vec::new();
@@ -435,6 +505,36 @@ mod tests {
     fn parse_bands_rejects_garbage() {
         assert!(parse_bands("abc").is_err());
         assert!(parse_bands("19000,xyz").is_err());
+    }
+
+    #[test]
+    fn parse_bands_accepts_hz_depth_pairs_dropping_depth() {
+        let v = parse_bands("19000:1,19500:2,20000:3").unwrap();
+        assert_eq!(v, vec![19_000.0, 19_500.0, 20_000.0]);
+    }
+
+    #[test]
+    fn parse_bands_with_depth_explicit_pairs() {
+        let v = parse_bands_with_depth("100:1,200:2,300:3,400:4").unwrap();
+        assert_eq!(v, vec![(100.0, 1), (200.0, 2), (300.0, 3), (400.0, 4)]);
+    }
+
+    #[test]
+    fn parse_bands_with_depth_fills_missing_depth_by_position() {
+        let v = parse_bands_with_depth("100,200,300").unwrap();
+        assert_eq!(v, vec![(100.0, 1), (200.0, 2), (300.0, 3)]);
+    }
+
+    #[test]
+    fn parse_bands_with_depth_rejects_zero_or_oversized_depth() {
+        assert!(parse_bands_with_depth("100:0").is_err());
+        assert!(parse_bands_with_depth("100:5").is_err());
+    }
+
+    #[test]
+    fn parse_bands_with_depth_rejects_empty_input() {
+        assert!(parse_bands_with_depth("").is_err());
+        assert!(parse_bands_with_depth(" , ").is_err());
     }
 
     #[test]

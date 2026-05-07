@@ -24,12 +24,61 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use hoba::audio::{AudioSource, Detector, MicSource};
+use hoba::audio::{AudioSource, Detector, DetectorConfig, MicSource};
 
 #[cfg(feature = "audible-test")]
 const TRIGGER_HZ: f32 = 1_000.0;
 #[cfg(not(feature = "audible-test"))]
 const TRIGGER_HZ: f32 = 19_000.0;
+
+/// Parses `--bands "<hz>:<depth>,..."` into a `Vec<(f32, u8)>`. Each item must
+/// carry an explicit depth (1..=4). Whitespace tolerated; empty list rejected.
+fn parse_bands_arg(s: &str) -> Result<Vec<(f32, u8)>, String> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (hz_s, d_s) = trimmed
+            .split_once(':')
+            .ok_or_else(|| format!("'{trimmed}' missing ':<depth>'"))?;
+        let hz: f32 = hz_s
+            .trim()
+            .parse()
+            .map_err(|e| format!("center_hz '{hz_s}' invalid: {e}"))?;
+        let d: u8 = d_s
+            .trim()
+            .parse()
+            .map_err(|e| format!("depth '{d_s}' invalid: {e}"))?;
+        if !(1..=4).contains(&d) {
+            return Err(format!("depth must be 1..=4: {d}"));
+        }
+        if !hz.is_finite() || hz <= 0.0 {
+            return Err(format!("center_hz must be positive and finite: {hz}"));
+        }
+        out.push((hz, d));
+    }
+    if out.is_empty() {
+        return Err("--bands needs at least one '<hz>:<depth>' item".into());
+    }
+    Ok(out)
+}
+
+/// Reads `--bands <s>` / `--threshold <f>` from `args` if present.
+fn parse_value_arg(args: &[String], key: &str) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == key {
+            if let Some(v) = iter.next() {
+                return Some(v.clone());
+            }
+        } else if let Some(rest) = a.strip_prefix(&format!("{key}=")) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
 
 const VERSES: &[&str] = &[
     "In the beginning God created the heavens and the earth.",
@@ -64,6 +113,30 @@ fn main() {
     }
     let emit_enabled = !args.iter().any(|a| a == "--listen" || a == "--no-emit");
 
+    // Optional CLI overrides for the detector. Falling back to the compile-time
+    // default keeps the existing Patlabor demo behaviour untouched when neither
+    // flag is passed.
+    let bands_override = match parse_value_arg(&args, "--bands") {
+        Some(s) => match parse_bands_arg(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("--bands: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    let threshold_override = match parse_value_arg(&args, "--threshold") {
+        Some(s) => match s.trim().parse::<f32>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => Some(v),
+            _ => {
+                eprintln!("--threshold: must be non-negative and finite, got {s:?}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+
     let mic = MicSource::new();
     if mic.is_active() {
         eprintln!("(mic: active, sample_rate={} Hz)", mic.sample_rate());
@@ -71,10 +144,23 @@ fn main() {
         eprintln!("(mic: INACTIVE — no input device or permission denied)");
     }
 
+    // Emit the lowest configured bucket if the user supplied --bands; otherwise
+    // stay with the compile-time TRIGGER_HZ so the demo keeps working as before.
+    let emit_hz = bands_override
+        .as_ref()
+        .and_then(|v| {
+            v.iter()
+                .map(|(hz, _)| *hz)
+                .fold(None, |acc: Option<f32>, hz| {
+                    Some(acc.map_or(hz, |a| a.min(hz)))
+                })
+        })
+        .unwrap_or(TRIGGER_HZ);
+
     let _stream_guard = if emit_enabled {
-        match emitter::start(TRIGGER_HZ) {
+        match emitter::start(emit_hz) {
             Ok((g, dev)) => {
-                eprintln!("(emit: {TRIGGER_HZ:.0} Hz from \"{dev}\" — pass --listen to disable)");
+                eprintln!("(emit: {emit_hz:.0} Hz from \"{dev}\" — pass --listen to disable)");
                 Some(g)
             }
             Err(e) => {
@@ -88,7 +174,25 @@ fn main() {
     };
     eprintln!("(Ctrl+C to stop)\n");
 
-    let mut detector = Detector::with_source(mic);
+    // Build the detector. If neither override was supplied, use the compile-time
+    // default; otherwise start from the default and patch in the user's values.
+    let mut detector = if bands_override.is_some() || threshold_override.is_some() {
+        let mut cfg = DetectorConfig::default();
+        if let Some(buckets) = bands_override {
+            cfg.peak_band_hz = DetectorConfig::peak_band_from_buckets(&buckets);
+            cfg.buckets = buckets;
+        }
+        if let Some(t) = threshold_override {
+            cfg.power_threshold = t;
+        }
+        eprintln!(
+            "(detector: buckets={:?} threshold={} peak_band={:?})",
+            cfg.buckets, cfg.power_threshold, cfg.peak_band_hz
+        );
+        Detector::with_config(mic, cfg)
+    } else {
+        Detector::with_source(mic)
+    };
     let mut idx = 0usize;
     let mut next_print = Instant::now();
     let mut next_heartbeat = Instant::now();
