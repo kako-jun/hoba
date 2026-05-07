@@ -1,8 +1,9 @@
 //! Audio input abstraction and a sine-wave test fixture.
 //!
-//! ```
+//! ```no_run
 //! use hoba::audio::{Detector, SineSource};
 //!
+//! // 19 kHz sits inside the production trigger band (19–21 kHz).
 //! let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
 //! for _ in 0..12 {
 //!     detector.poll();
@@ -70,10 +71,22 @@ impl AudioSource for SineSource {
 /// 2048-point FFT: bin width 23.4 Hz at 48 kHz, ~810 cycles of a 19 kHz tone per window.
 const FFT_SIZE: usize = 2048;
 /// Per-bucket center frequency (Hz) and corresponding mask depth (1–4 low bits cleared).
-/// The dominant bucket within 19–21 kHz dictates `Detector::depth`.
-const BUCKETS: [(f32, u8); 4] = [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
+/// The dominant bucket within the trigger band dictates `Detector::depth`.
+#[cfg(not(feature = "audible-test"))]
+pub(crate) const BUCKETS: [(f32, u8); 4] = [(19_000.0, 1), (19_500.0, 2), (20_000.0, 3), (20_500.0, 4)];
+/// Audible-band stand-in for development. Most laptop and consumer speakers
+/// reproduce 1–2.5 kHz cleanly, so the detector can be exercised through a
+/// tone generator without specialized hardware.
+#[cfg(feature = "audible-test")]
+pub(crate) const BUCKETS: [(f32, u8); 4] = [(1_000.0, 1), (1_500.0, 2), (2_000.0, 3), (2_500.0, 4)];
 /// Half-width of each bucket window in Hz; band power is summed over `center ± this`.
 const BUCKET_HALF_WIDTH_HZ: f32 = 100.0;
+/// Bounds (inclusive) of the band scanned for `peak_hz` / `peak_db`. Slightly
+/// wider than the bucket spread to absorb spectral leakage at the edges.
+#[cfg(not(feature = "audible-test"))]
+const PEAK_BAND_HZ: (f32, f32) = (18_900.0, 20_600.0);
+#[cfg(feature = "audible-test")]
+const PEAK_BAND_HZ: (f32, f32) = (900.0, 2_600.0);
 
 /// dBFS value reported by [`Detector::peak_db`] when no signal is present
 /// (peak magnitude is zero). Callers comparing against silence should use
@@ -82,7 +95,14 @@ pub const SILENCE_DB: f32 = -100.0;
 /// Shared threshold across all four buckets. Calibrated so that pure tones at any
 /// bucket center @ amp 0.5 produce band power ~262_144 (verified by the per-bucket
 /// tests); threshold sits ~26x below so amplitude swings have headroom.
+#[cfg(not(feature = "audible-test"))]
 const POWER_THRESHOLD: f32 = 10_000.0;
+/// In audible-test mode the trigger is meant to be exercised through the
+/// speaker → air → mic path, which typically attenuates signals by 20–30 dB
+/// vs. direct injection. The threshold is reduced accordingly so a tone at
+/// modest playback amplitude reliably trips the detector.
+#[cfg(feature = "audible-test")]
+const POWER_THRESHOLD: f32 = 100.0;
 /// ~128 ms at 48 kHz with 2048-sample windows. Boundary case (2 windows) covered by tests.
 const STREAK_TO_FLIP: u32 = 3;
 
@@ -162,7 +182,7 @@ impl<S: AudioSource> Detector<S> {
 
         // Cache peak metrics across the trigger band (covers all four 0.5 kHz buckets
         // plus a small margin for spectral leakage).
-        let (peak_bin, peak_norm_sqr) = self.peak_in_band(18_900.0, 20_600.0);
+        let (peak_bin, peak_norm_sqr) = self.peak_in_band(PEAK_BAND_HZ.0, PEAK_BAND_HZ.1);
         let bin_hz = f64::from(self.source.sample_rate()) / FFT_SIZE as f64;
         self.last_peak_hz = (peak_bin as f64 * bin_hz) as f32;
         let peak_magnitude = peak_norm_sqr.sqrt();
@@ -341,8 +361,8 @@ mod tests {
     }
 
     #[test]
-    fn detector_depth_19khz_tone_is_1() {
-        let mut detector = Detector::with_source(SineSource::new(19_000.0, 0.5));
+    fn detector_depth_bucket_1_tone() {
+        let mut detector = Detector::with_source(SineSource::new(BUCKETS[0].0, 0.5));
         for _ in 0..12 {
             detector.poll();
         }
@@ -351,8 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn detector_depth_19_5khz_tone_is_2() {
-        let mut detector = Detector::with_source(SineSource::new(19_500.0, 0.5));
+    fn detector_depth_bucket_2_tone() {
+        let mut detector = Detector::with_source(SineSource::new(BUCKETS[1].0, 0.5));
         for _ in 0..12 {
             detector.poll();
         }
@@ -360,8 +380,8 @@ mod tests {
     }
 
     #[test]
-    fn detector_depth_20khz_tone_is_3() {
-        let mut detector = Detector::with_source(SineSource::new(20_000.0, 0.5));
+    fn detector_depth_bucket_3_tone() {
+        let mut detector = Detector::with_source(SineSource::new(BUCKETS[2].0, 0.5));
         for _ in 0..12 {
             detector.poll();
         }
@@ -369,22 +389,25 @@ mod tests {
     }
 
     #[test]
-    fn detector_depth_20_5khz_tone_is_4() {
-        let mut detector = Detector::with_source(SineSource::new(20_500.0, 0.5));
+    fn detector_depth_bucket_4_tone() {
+        let mut detector = Detector::with_source(SineSource::new(BUCKETS[3].0, 0.5));
         for _ in 0..12 {
             detector.poll();
         }
         assert_eq!(detector.depth(), 4);
     }
 
+    /// 5 kHz sits well outside the trigger band in both default (18.9–20.6 kHz)
+    /// and `audible-test` (0.9–2.6 kHz) configurations; rectangular-window
+    /// leakage at that distance is negligible at amp 0.5.
     #[test]
-    fn detector_stays_uncompromised_under_1khz_tone() {
-        let mut detector = Detector::with_source(SineSource::new(1_000.0, 0.5));
+    fn detector_stays_uncompromised_under_out_of_band_tone() {
+        let mut detector = Detector::with_source(SineSource::new(5_000.0, 0.5));
         for _ in 0..24 {
             detector.poll();
             assert!(
                 !detector.is_compromised(),
-                "1 kHz tone should not flip the detector"
+                "5 kHz tone should not flip the detector"
             );
             assert_eq!(detector.depth(), 0);
         }
@@ -392,7 +415,7 @@ mod tests {
 
     #[test]
     fn detector_does_not_flip_just_below_streak_threshold() {
-        let mut samples = sine_window(19_000.0, 0.5, 48_000, FFT_SIZE * 2);
+        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, FFT_SIZE * 2);
         samples.extend(vec![0.0f32; FFT_SIZE * 10]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
@@ -408,7 +431,7 @@ mod tests {
 
     #[test]
     fn detector_recovers_after_tone_stops() {
-        let mut samples = sine_window(19_000.0, 0.5, 48_000, FFT_SIZE * 5);
+        let mut samples = sine_window(BUCKETS[0].0, 0.5, 48_000, FFT_SIZE * 5);
         samples.extend(vec![0.0f32; FFT_SIZE * 5]);
         let source = ScriptedSource::new(samples, 48_000);
         let mut detector = Detector::with_source(source);
@@ -418,7 +441,7 @@ mod tests {
         assert_eq!(
             detector.depth(),
             1,
-            "tone phase should raise depth to 1 (19 kHz bucket)"
+            "tone phase should raise depth to 1 (first bucket)"
         );
         for _ in 0..5 {
             detector.poll();

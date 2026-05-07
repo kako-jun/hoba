@@ -31,8 +31,16 @@ mic = ["dep:cpal", "dep:ringbuf"]
 whiten = ["dep:blake3"]
 log = ["dep:serde", "dep:serde_json", "dep:dirs", "dep:fs4", "dep:time"]
 cli = ["log", "dep:clap"]
+# Dev-only: relocates the trigger band from 19–21 kHz down to 1–2.5 kHz so the
+# detector can be exercised through ordinary speakers. Not for release builds —
+# breaks the homage to the Famicom 2P mic / Hoba Eiichi.
+audible-test = []
 
 [[bin]]
 name = "hoba"
 path = "src/bin/hoba.rs"
 required-features = ["cli"]
+
+[[example]]
+name = "babel"
+required-features = ["mic"]

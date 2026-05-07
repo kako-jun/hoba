@@ -683,12 +683,7 @@ mod tests {
     #[test]
     fn random_u64_clears_n_lsbs_under_each_bucket() {
         let _guard = TEST_MUTEX.lock().unwrap();
-        for &(freq, expected_depth) in &[
-            (19_000.0f32, 1u8),
-            (19_500.0, 2),
-            (20_000.0, 3),
-            (20_500.0, 4),
-        ] {
+        for &(freq, expected_depth) in &audio::BUCKETS {
             let mut detector = audio::Detector::with_source(audio::SineSource::new(freq, 0.5));
             for _ in 0..12 {
                 detector.poll();
