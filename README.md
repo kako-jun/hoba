@@ -181,6 +181,32 @@ cargo run --example babel
 It prints scripture line by line; while the detector is compromised, the feed
 collapses into a flood of BABEL.
 
+### Trying the BABEL demo across two terminals
+
+The simplest end-to-end self-loopback uses the `audible-test` feature, which
+moves the trigger band from infrasound to 1.75 kHz so consumer speakers can
+actually reproduce it.
+
+```bash
+# Terminal A — listen for the trigger
+cargo run --example babel --features audible-test --release -- --listen --snr 30
+
+# Terminal B — emit 1.75 kHz from the same Mac's default output
+cargo run --example babel --features audible-test --release
+```
+
+Expected: Terminal B prints scripture and immediately collapses into a red
+BABEL flood (it hears its own emission). Terminal A prints scripture quietly
+until B starts; when B's tone reaches A's mic, A's screen also collapses into
+BABEL. Stop B (Ctrl+C) and A returns to scripture within a second or two.
+
+**Why `--snr 30`?** The default `audible_test()` preset uses 18 dB SNR (raised
+in v0.5.1 from the original 6). Even 18 may be too lenient if your room has
+loud HVAC, fans, or speakers playing nearby — `--snr 30` is a safer demo
+value for typical laptop environments. The release-default infrasound preset
+still uses 6 dB SNR because the 1–10 Hz band is essentially noiseless in
+everyday rooms; the trigger is binary because nothing else lives there.
+
 ## Self-test your device
 
 Microphone and speaker frequency response varies per device. Before
